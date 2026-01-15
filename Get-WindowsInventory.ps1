@@ -2378,67 +2378,139 @@ $sec = $inventory.Security
 
 $htmlStyle = @"
 <style>
-  body { 
-    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-    margin: 20px; 
-    background-color: #f5f5f5; 
+  * { box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    margin: 0;
+    padding: 0;
+    background-color: #f5f5f5;
   }
-  .header { 
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-    color: white; 
-    padding: 30px; 
-    border-radius: 10px; 
-    margin-bottom: 20px; 
+  .header {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    padding: 20px 30px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
   }
   .header h1 { margin: 0; font-size: 2em; }
   .header p { margin: 5px 0; opacity: 0.9; }
-  .section { 
-    background: white; 
-    padding: 20px; 
-    margin-bottom: 20px; 
-    border-radius: 10px; 
-    box-shadow: 0 2px 4px rgba(0,0,0,0.1); 
+
+  /* Tab Navigation */
+  .tab-nav {
+    background: white;
+    border-bottom: 2px solid #667eea;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    position: sticky;
+    top: 0;
+    z-index: 1000;
   }
-  .section h2 { 
-    color: #667eea; 
-    border-bottom: 2px solid #667eea; 
-    padding-bottom: 10px; 
-    margin-top: 0; 
+  .tab-nav ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
   }
-  table { 
-    border-collapse: collapse; 
-    width: 100%; 
-    margin-bottom: 20px; 
+  .tab-nav li {
+    flex: 0 0 auto;
   }
-  th { 
-    background-color: #667eea; 
-    color: white; 
-    padding: 12px; 
-    text-align: left; 
-    font-weight: 600; 
+  .tab-nav button {
+    background: none;
+    border: none;
+    padding: 15px 25px;
+    font-size: 1em;
+    font-weight: 600;
+    color: #666;
+    cursor: pointer;
+    border-bottom: 3px solid transparent;
+    transition: all 0.3s;
   }
-  td { 
-    padding: 10px; 
-    border-bottom: 1px solid #e0e0e0; 
+  .tab-nav button:hover {
+    background: #f8f9fa;
+    color: #667eea;
+  }
+  .tab-nav button.active {
+    color: #667eea;
+    border-bottom-color: #667eea;
+    background: #f8f9fa;
+  }
+
+  /* Tab Content */
+  .tab-content {
+    display: none;
+    padding: 20px;
+    animation: fadeIn 0.3s;
+  }
+  .tab-content.active {
+    display: block;
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  .section {
+    background: white;
+    padding: 20px;
+    margin-bottom: 20px;
+    border-radius: 10px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  }
+  .section h2 {
+    color: #667eea;
+    border-bottom: 2px solid #667eea;
+    padding-bottom: 10px;
+    margin-top: 0;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin-bottom: 20px;
+    font-size: 0.9em;
+  }
+  th {
+    background-color: #667eea;
+    color: white;
+    padding: 12px;
+    text-align: left;
+    font-weight: 600;
+    cursor: pointer;
+    user-select: none;
+    position: relative;
+  }
+  th:hover { background-color: #5568d3; }
+  th.sortable:after {
+    content: ' ⇅';
+    opacity: 0.5;
+  }
+  th.sorted-asc:after {
+    content: ' ▲';
+    opacity: 1;
+  }
+  th.sorted-desc:after {
+    content: ' ▼';
+    opacity: 1;
+  }
+  td {
+    padding: 10px;
+    border-bottom: 1px solid #e0e0e0;
   }
   tr:hover { background-color: #f8f9fa; }
-  .metric { 
-    display: inline-block; 
-    background: #f8f9fa; 
-    padding: 15px 20px; 
-    margin: 10px 10px 10px 0; 
-    border-radius: 8px; 
-    border-left: 4px solid #667eea; 
+  .metric {
+    display: inline-block;
+    background: #f8f9fa;
+    padding: 15px 20px;
+    margin: 10px 10px 10px 0;
+    border-radius: 8px;
+    border-left: 4px solid #667eea;
   }
-  .metric-label { 
-    font-size: 0.85em; 
-    color: #666; 
-    text-transform: uppercase; 
+  .metric-label {
+    font-size: 0.85em;
+    color: #666;
+    text-transform: uppercase;
   }
-  .metric-value { 
-    font-size: 1.5em; 
-    font-weight: bold; 
-    color: #333; 
+  .metric-value {
+    font-size: 1.5em;
+    font-weight: bold;
+    color: #333;
   }
   .warning { background-color: #fff3cd; border-left-color: #ffc107; }
   .danger { background-color: #f8d7da; border-left-color: #dc3545; }
@@ -2446,11 +2518,138 @@ $htmlStyle = @"
   .info { background-color: #d1ecf1; border-left-color: #17a2b8; }
   a { color: #667eea; text-decoration: none; }
   a:hover { text-decoration: underline; }
-  .footer { 
-    text-align: center; 
-    padding: 20px; 
-    color: #666; 
-    font-size: 0.9em; 
+
+  /* Data Explorer */
+  .file-browser {
+    display: grid;
+    grid-template-columns: 300px 1fr;
+    gap: 20px;
+    min-height: 500px;
+  }
+  .file-list {
+    background: white;
+    padding: 15px;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    max-height: 600px;
+    overflow-y: auto;
+  }
+  .file-item {
+    padding: 10px;
+    margin: 5px 0;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-size: 0.9em;
+  }
+  .file-item:hover {
+    background: #f8f9fa;
+  }
+  .file-item.active {
+    background: #667eea;
+    color: white;
+  }
+  .file-item .file-icon {
+    margin-right: 8px;
+  }
+  .file-viewer {
+    background: white;
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    overflow: auto;
+  }
+
+  /* Search and Filter */
+  .controls {
+    margin-bottom: 15px;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .controls input, .controls select {
+    padding: 8px 12px;
+    border: 1px solid #ddd;
+    border-radius: 5px;
+    font-size: 0.9em;
+  }
+  .controls input[type="text"] {
+    flex: 1;
+    min-width: 200px;
+  }
+  .controls button {
+    padding: 8px 16px;
+    background: #667eea;
+    color: white;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 0.9em;
+  }
+  .controls button:hover {
+    background: #5568d3;
+  }
+
+  /* Comparison View */
+  .comparison-container {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+  }
+  .comparison-panel {
+    background: white;
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  }
+
+  /* JSON Viewer */
+  .json-viewer {
+    background: #f8f9fa;
+    padding: 15px;
+    border-radius: 5px;
+    font-family: 'Courier New', monospace;
+    font-size: 0.85em;
+    max-height: 600px;
+    overflow: auto;
+  }
+
+  /* Pagination */
+  .pagination {
+    display: flex;
+    justify-content: center;
+    gap: 5px;
+    margin-top: 15px;
+  }
+  .pagination button {
+    padding: 5px 10px;
+    border: 1px solid #ddd;
+    background: white;
+    cursor: pointer;
+    border-radius: 3px;
+  }
+  .pagination button.active {
+    background: #667eea;
+    color: white;
+  }
+  .pagination button:hover:not(.active) {
+    background: #f8f9fa;
+  }
+
+  .footer {
+    text-align: center;
+    padding: 20px;
+    color: #666;
+    font-size: 0.9em;
+    background: white;
+    margin-top: 20px;
+  }
+
+  .loading {
+    text-align: center;
+    padding: 40px;
+    color: #666;
   }
 </style>
 "@
@@ -2794,12 +2993,312 @@ if ($inventory.Metadata.ErrorCount -gt 0) {
   $errorSection = "<div class='section danger'><h2>[!] Collection Errors ($($inventory.Metadata.ErrorCount))</h2><p>Some data collection operations encountered errors. See <a href='csv/collection_errors.csv'>collection_errors.csv</a> for details.</p></div>"
 }
 
-$htmlContent = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Windows Inventory Report - $($sys.ComputerName)</title>$htmlStyle</head><body>"
+# Build JavaScript for interactive features
+$javaScript = @"
+<script>
+// Tab Management
+function switchTab(tabName) {
+  document.querySelectorAll('.tab-content').forEach(tab => tab.classList.remove('active'));
+  document.querySelectorAll('.tab-nav button').forEach(btn => btn.classList.remove('active'));
+  document.getElementById(tabName).classList.add('active');
+  event.target.classList.add('active');
+
+  if (tabName === 'data-explorer' && !window.explorerInitialized) {
+    initDataExplorer();
+    window.explorerInitialized = true;
+  } else if (tabName === 'report-comparison' && !window.comparisonInitialized) {
+    initReportComparison();
+    window.comparisonInitialized = true;
+  }
+}
+
+// CSV Parser
+function parseCSV(text) {
+  const lines = text.split('\n').filter(line => line.trim());
+  if (lines.length === 0) return [];
+
+  const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$('$/g, ''));
+  const rows = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const values = [];
+    let current = '';
+    let inQuotes = false;
+
+    for (let char of lines[i]) {
+      if (char === '"') {
+        inQuotes = !inQuotes;
+      } else if (char === ',' && !inQuotes) {
+        values.push(current.trim().replace(/^"|"$('$/g, ''));
+        current = '';
+      } else {
+        current += char;
+      }
+    }
+    values.push(current.trim().replace(/^"|"$('$/g, ''));
+
+    if (values.length === headers.length) {
+      const obj = {};
+      headers.forEach((header, idx) => {
+        obj[header] = values[idx];
+      });
+      rows.push(obj);
+    }
+  }
+  return rows;
+}
+
+// Render Table with Sort
+function renderTable(data, containerId, options = {}) {
+  if (!data || data.length === 0) {
+    document.getElementById(containerId).innerHTML = '<p>No data available</p>';
+    return;
+  }
+
+  const pageSize = options.pageSize || 50;
+  let currentPage = 0;
+  let sortColumn = null;
+  let sortDirection = 'asc';
+  let filteredData = [...data];
+
+  function render() {
+    const start = currentPage * pageSize;
+    const end = start + pageSize;
+    const pageData = filteredData.slice(start, end);
+
+    const headers = Object.keys(data[0]);
+    let html = '<div class=\"controls\">';
+    html += '<input type=\"text\" id=\"' + containerId + '-search\" placeholder=\"Search...\" onkeyup=\"filterTable' + containerId + '(this.value)\">';
+    html += '<span>Showing ' + (start + 1) + '-' + Math.min(end, filteredData.length) + ' of ' + filteredData.length + '</span>';
+    html += '</div>';
+
+    html += '<table id=\"' + containerId + '-table\"><thead><tr>';
+    headers.forEach(header => {
+      const sortClass = sortColumn === header ? ('sorted-' + sortDirection) : 'sortable';
+      html += '<th class=\"' + sortClass + '\" onclick=\"sortTable' + containerId + '(\\'' + header + '\\')'>\">\" + header + '</th>';
+    });
+    html += '</tr></thead><tbody>';
+
+    pageData.forEach(row => {
+      html += '<tr>';
+      headers.forEach(header => {
+        const value = row[header] || '';
+        const displayValue = value.length > 100 ? value.substring(0, 97) + '...' : value;
+        html += '<td title=\"' + value.replace(/\"/g, '&quot;') + '\">' + displayValue + '</td>';
+      });
+      html += '</tr>';
+    });
+
+    html += '</tbody></table>';
+
+    // Pagination
+    const totalPages = Math.ceil(filteredData.length / pageSize);
+    if (totalPages > 1) {
+      html += '<div class=\"pagination\">';
+      if (currentPage > 0) {
+        html += '<button onclick=\"changePage' + containerId + '(' + (currentPage - 1) + ')\">Previous</button>';
+      }
+      for (let i = 0; i < Math.min(totalPages, 10); i++) {
+        const btnClass = i === currentPage ? 'active' : '';
+        html += '<button class=\"' + btnClass + '\" onclick=\"changePage' + containerId + '(' + i + ')\">' + (i + 1) + '</button>';
+      }
+      if (currentPage < totalPages - 1) {
+        html += '<button onclick=\"changePage' + containerId + '(' + (currentPage + 1) + ')\">Next</button>';
+      }
+      html += '</div>';
+    }
+
+    document.getElementById(containerId).innerHTML = html;
+  }
+
+  window['sortTable' + containerId] = function(column) {
+    if (sortColumn === column) {
+      sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
+    } else {
+      sortColumn = column;
+      sortDirection = 'asc';
+    }
+
+    filteredData.sort((a, b) => {
+      const aVal = a[column] || '';
+      const bVal = b[column] || '';
+      const comparison = aVal.localeCompare(bVal, undefined, { numeric: true });
+      return sortDirection === 'asc' ? comparison : -comparison;
+    });
+
+    render();
+  };
+
+  window['filterTable' + containerId] = function(searchTerm) {
+    searchTerm = searchTerm.toLowerCase();
+    filteredData = data.filter(row => {
+      return Object.values(row).some(val =>
+        String(val).toLowerCase().includes(searchTerm)
+      );
+    });
+    currentPage = 0;
+    render();
+  };
+
+  window['changePage' + containerId] = function(page) {
+    currentPage = page;
+    render();
+  };
+
+  render();
+}
+
+// Data Explorer
+function initDataExplorer() {
+  const files = [
+    { name: 'inventory.json', type: 'json', path: 'inventory.json', category: 'Summary' },
+    { name: 'processes.csv', type: 'csv', path: 'csv/processes.csv', category: 'Inventory' },
+    { name: 'services.csv', type: 'csv', path: 'csv/services.csv', category: 'Inventory' },
+    { name: 'tasks.csv', type: 'csv', path: 'csv/scheduled_tasks.csv', category: 'Inventory' },
+    { name: 'users.csv', type: 'csv', path: 'csv/users.csv', category: 'Inventory' },
+    { name: 'group_members.csv', type: 'csv', path: 'csv/group_members.csv', category: 'Inventory' },
+    { name: 'software.csv', type: 'csv', path: 'csv/software.csv', category: 'Inventory' },
+    { name: 'patches.csv', type: 'csv', path: 'csv/patches.csv', category: 'Inventory' },
+    { name: 'autoruns.csv', type: 'csv', path: 'csv/autoruns.csv', category: 'Inventory' },
+    { name: 'network_connections.csv', type: 'csv', path: 'csv/network_connections_enhanced.csv', category: 'Network' },
+    { name: 'established_connections.csv', type: 'csv', path: 'csv/established_connections.csv', category: 'Network' },
+    { name: 'listening_ports.csv', type: 'csv', path: 'csv/listening_ports.csv', category: 'Network' },
+    { name: 'shares.csv', type: 'csv', path: 'csv/shares.csv', category: 'Network' },
+    { name: 'certificates.csv', type: 'csv', path: 'csv/certificates.csv', category: 'Security' },
+    { name: 'firewall_rules.csv', type: 'csv', path: 'csv/firewall_rules.csv', category: 'Security' },
+    { name: 'suspicious_processes.csv', type: 'csv', path: 'csv/threat_suspicious_processes.csv', category: 'Threats' },
+    { name: 'suspicious_services.csv', type: 'csv', path: 'csv/threat_suspicious_services.csv', category: 'Threats' },
+    { name: 'suspicious_tasks.csv', type: 'csv', path: 'csv/threat_suspicious_tasks.csv', category: 'Threats' },
+    { name: 'suspicious_connections.csv', type: 'csv', path: 'csv/threat_suspicious_connections.csv', category: 'Threats' },
+    { name: 'unauthorized_admins.csv', type: 'csv', path: 'csv/threat_unauthorized_admins.csv', category: 'Threats' },
+    { name: 'security_weaknesses.csv', type: 'csv', path: 'csv/security_weaknesses.csv', category: 'Threats' }
+  ];
+
+  let currentCategory = 'All';
+  const categories = ['All', 'Summary', 'Inventory', 'Network', 'Security', 'Threats'];
+
+  function renderFileList() {
+    const filteredFiles = currentCategory === 'All' ? files : files.filter(f => f.category === currentCategory);
+
+    let html = '<div style=\"margin-bottom: 15px;\">';
+    html += '<select onchange=\"filterByCategory(this.value)\" style=\"width: 100%; padding: 8px; border-radius: 5px; border: 1px solid #ddd;\">';
+    categories.forEach(cat => {
+      html += '<option value=\"' + cat + '\"' + (cat === currentCategory ? ' selected' : '') + '>' + cat + '</option>';
+    });
+    html += '</select></div>';
+
+    filteredFiles.forEach(file => {
+      const icon = file.type === 'json' ? '📄' : '📊';
+      html += '<div class=\"file-item\" onclick=\"loadFile(\\'' + file.path + '\\', \\'' + file.type + '\\', \\'' + file.name + '\\')\"><span class=\"file-icon\">' + icon + '</span>' + file.name + '</div>';
+    });
+
+    document.getElementById('file-list').innerHTML = html;
+  }
+
+  window.filterByCategory = function(category) {
+    currentCategory = category;
+    renderFileList();
+  };
+
+  window.loadFile = function(path, type, name) {
+    document.querySelectorAll('.file-item').forEach(item => item.classList.remove('active'));
+    event.target.closest('.file-item').classList.add('active');
+
+    document.getElementById('file-viewer').innerHTML = '<div class=\"loading\">Loading ' + name + '...</div>';
+
+    fetch(path)
+      .then(response => {
+        if (!response.ok) throw new Error('File not found');
+        return response.text();
+      })
+      .then(text => {
+        if (type === 'csv') {
+          const data = parseCSV(text);
+          if (data.length > 0) {
+            document.getElementById('file-viewer').innerHTML = '<h3>' + name + '</h3><div id=\"csv-viewer\"></div>';
+            renderTable(data, 'csv-viewer');
+          } else {
+            document.getElementById('file-viewer').innerHTML = '<h3>' + name + '</h3><p>No data in file</p>';
+          }
+        } else if (type === 'json') {
+          try {
+            const json = JSON.parse(text);
+            document.getElementById('file-viewer').innerHTML = '<h3>' + name + '</h3><div class=\"json-viewer\"><pre>' + JSON.stringify(json, null, 2) + '</pre></div>';
+          } catch (e) {
+            document.getElementById('file-viewer').innerHTML = '<h3>' + name + '</h3><p>Error parsing JSON: ' + e.message + '</p>';
+          }
+        }
+      })
+      .catch(err => {
+        document.getElementById('file-viewer').innerHTML = '<h3>' + name + '</h3><p style=\"color: #dc3545;\">File not available: ' + err.message + '</p>';
+      });
+  };
+
+  renderFileList();
+}
+
+// Report Comparison
+function initReportComparison() {
+  document.getElementById('comparison-viewer').innerHTML = '<p>Select report folder, category, and click Compare to view differences between inventory runs.</p>';
+}
+
+window.compareReports = function() {
+  const folder = document.getElementById('comparison-folder').value;
+  const category = document.getElementById('comparison-category').value;
+
+  if (!folder) {
+    alert('Please enter a report folder path');
+    return;
+  }
+
+  document.getElementById('comparison-viewer').innerHTML = '<div class=\"loading\">Loading comparison...</div>';
+
+  const baselinePath = 'csv/' + category + '.csv';
+  const comparisonPath = '../' + folder + '/csv/' + category + '.csv';
+
+  Promise.all([
+    fetch(baselinePath).then(r => r.text()).then(parseCSV),
+    fetch(comparisonPath).then(r => r.text()).then(parseCSV)
+  ])
+  .then(([baselineData, comparisonData]) => {
+    // Simple comparison - just show side by side
+    let html = '<div class=\"comparison-container\">';
+    html += '<div class=\"comparison-panel\"><h3>Current Report (' + baselineData.length + ' items)</h3><div id=\"comparison-left\"></div></div>';
+    html += '<div class=\"comparison-panel\"><h3>Selected Report (' + comparisonData.length + ' items)</h3><div id=\"comparison-right\"></div></div>';
+    html += '</div>';
+
+    document.getElementById('comparison-viewer').innerHTML = html;
+    renderTable(baselineData, 'comparison-left', { pageSize: 25 });
+    renderTable(comparisonData, 'comparison-right', { pageSize: 25 });
+  })
+  .catch(err => {
+    document.getElementById('comparison-viewer').innerHTML = '<p style=\"color: #dc3545;\">Error loading reports: ' + err.message + '</p><p>Make sure the folder path is correct relative to this report.</p>';
+  });
+};
+
+// Initialize
+document.addEventListener('DOMContentLoaded', function() {
+  switchTab('dashboard');
+});
+</script>
+"@
+
+$htmlContent = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Windows Inventory Report - $($sys.ComputerName)</title>$htmlStyle$javaScript</head><body>"
 $htmlContent += "<div class='header'><h1>Windows Inventory Report - CCDC Edition</h1>"
 $htmlContent += "<p><b>Computer:</b> $($sys.ComputerName) | <b>Collected:</b> $($inventory.Metadata.CollectedAt)</p>"
 $htmlContent += "<p><b>Duration:</b> $($inventory.Metadata.ExecutionTime.DurationSeconds)s | <b>Quick Mode:</b> $($inventory.Metadata.QuickMode)</p></div>"
+
+# Tab Navigation
+$htmlContent += "<nav class='tab-nav'><ul>"
+$htmlContent += "<li><button onclick='switchTab(\"dashboard\")' class='active'>Dashboard</button></li>"
+$htmlContent += "<li><button onclick='switchTab(\"baseline-comparison\")'>Baseline Comparison</button></li>"
+$htmlContent += "<li><button onclick='switchTab(\"data-explorer\")'>Data Explorer</button></li>"
+$htmlContent += "<li><button onclick='switchTab(\"report-comparison\")'>Report Comparison</button></li>"
+$htmlContent += "</ul></nav>"
+
+# Tab 1: Dashboard
+$htmlContent += "<div id='dashboard' class='tab-content active'>"
 $htmlContent += $errorSection
-$htmlContent += $baselineSection
 $htmlContent += $threatSummary
 $htmlContent += "<div class='section'><h2>Summary Metrics</h2>$summaryMetrics</div>"
 $htmlContent += "<div class='section'><h2>System Details</h2>$summaryHtml</div>"
@@ -2807,10 +3306,48 @@ $htmlContent += "<div class='section'><h2>Artifacts &amp; Reports</h2>"
 $htmlContent += "<p><b>JSON Summary:</b> <a href='inventory.json'>inventory.json</a></p>"
 $htmlContent += "<p><b>Collection Log:</b> <a href='collection.log'>collection.log</a></p>"
 $htmlContent += $artifactLinks
+$htmlContent += "</div></div>"
+
+# Tab 2: Baseline Comparison
+$htmlContent += "<div id='baseline-comparison' class='tab-content'>"
+$htmlContent += $baselineSection
+if (-not $baselineSection) {
+  $htmlContent += "<div class='section info'><h2>Baseline Comparison</h2><p>No baseline comparison available. Run the script to create or compare with baseline.</p></div>"
+}
 $htmlContent += "</div>"
-$htmlContent += "<div class='footer'><p>Generated by Get-WindowsInventory.ps1 v2.1 (CCDC Enhanced Edition)</p>"
+
+# Tab 3: Data Explorer
+$htmlContent += "<div id='data-explorer' class='tab-content'>"
+$htmlContent += "<div class='section'><h2>Data Explorer</h2>"
+$htmlContent += "<p>Browse and view all CSV and JSON files generated during inventory collection. Click any file to view its contents in an interactive, searchable table.</p>"
+$htmlContent += "<div class='file-browser'>"
+$htmlContent += "<div id='file-list' class='file-list'></div>"
+$htmlContent += "<div id='file-viewer' class='file-viewer'><p>Select a file from the list to view its contents</p></div>"
+$htmlContent += "</div></div></div>"
+
+# Tab 4: Report Comparison
+$htmlContent += "<div id='report-comparison' class='tab-content'>"
+$htmlContent += "<div class='section'><h2>Report Comparison</h2>"
+$htmlContent += "<p>Compare data between this report and another inventory report. Enter the folder name of another report (relative to parent directory).</p>"
+$htmlContent += "<div class='controls'>"
+$htmlContent += "<input type='text' id='comparison-folder' placeholder='e.g., System_Inventory_2024-01-15_10-30-00' style='flex: 2;'>"
+$htmlContent += "<select id='comparison-category' style='flex: 1;'>"
+$htmlContent += "<option value='processes'>Processes</option>"
+$htmlContent += "<option value='services'>Services</option>"
+$htmlContent += "<option value='scheduled_tasks'>Scheduled Tasks</option>"
+$htmlContent += "<option value='users'>Users</option>"
+$htmlContent += "<option value='software'>Software</option>"
+$htmlContent += "<option value='autoruns'>Autoruns</option>"
+$htmlContent += "<option value='network_connections_enhanced'>Network Connections</option>"
+$htmlContent += "</select>"
+$htmlContent += "<button onclick='compareReports()'>Compare</button>"
+$htmlContent += "</div>"
+$htmlContent += "<div id='comparison-viewer' style='margin-top: 20px;'></div>"
+$htmlContent += "</div></div>"
+
+$htmlContent += "<div class='footer'><p>Generated by Get-WindowsInventory.ps1 v2.2 (CCDC Enhanced Edition with Interactive Report Viewer)</p>"
 $htmlContent += "<p>Report Directory: $reportDir</p>"
-$htmlContent += "<p style='margin-top: 10px; font-size: 0.9em;'><strong>CCDC Features:</strong> Automated threat detection, suspicious activity flagging, security weakness identification, and actionable recommendations for defenders.</p>"
+$htmlContent += "<p style='margin-top: 10px; font-size: 0.9em;'><strong>CCDC Features:</strong> Automated threat detection, suspicious activity flagging, security weakness identification, baseline comparison, interactive data exploration, and report comparison.</p>"
 $htmlContent += "</div></body></html>"
 
 try {
