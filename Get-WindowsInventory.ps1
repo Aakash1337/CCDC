@@ -1886,77 +1886,31 @@ if ($inventory.ThreatAnalysis.SecurityWeaknesses.Count -gt 0) {
 
 if ($totalThreats -gt 0 -or $criticalWeaknesses -gt 0) {
   $threatClass = if ($criticalWeaknesses -gt 0) { "danger" } elseif ($totalThreats -gt 5) { "warning" } else { "info" }
-  $threatSummary = @"
-<div class="section $threatClass">
-  <h2>[!] CCDC THREAT ANALYSIS - IMMEDIATE ATTENTION REQUIRED</h2>
-  <div style="font-size: 1.2em; margin: 15px 0;">
-    <strong>Total Suspicious Items: $totalThreats</strong> |
-    <strong>Critical Security Issues: $criticalWeaknesses</strong>
-  </div>
-  <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-top: 20px;">
-    $(if ($inventory.ThreatAnalysis.SuspiciousProcesses.Count -gt 0) {
-      "<div class='metric danger'>
-        <div class='metric-label'>Suspicious Processes</div>
-        <div class='metric-value'>$($inventory.ThreatAnalysis.SuspiciousProcesses.Count)</div>
-        <div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_suspicious_processes.csv' style='color: #721c24;'>View Details</a></div>
-      </div>"
-    })
-    $(if ($inventory.ThreatAnalysis.SuspiciousServices.Count -gt 0) {
-      "<div class='metric danger'>
-        <div class='metric-label'>Suspicious Services</div>
-        <div class='metric-value'>$($inventory.ThreatAnalysis.SuspiciousServices.Count)</div>
-        <div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_suspicious_services.csv' style='color: #721c24;'>View Details</a></div>
-      </div>"
-    })
-    $(if ($inventory.ThreatAnalysis.SuspiciousTasks.Count -gt 0) {
-      "<div class='metric danger'>
-        <div class='metric-label'>Suspicious Scheduled Tasks</div>
-        <div class='metric-value'>$($inventory.ThreatAnalysis.SuspiciousTasks.Count)</div>
-        <div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_suspicious_tasks.csv' style='color: #721c24;'>View Details</a></div>
-      </div>"
-    })
-    $(if ($inventory.ThreatAnalysis.SuspiciousConnections.Count -gt 0) {
-      "<div class='metric danger'>
-        <div class='metric-label'>Suspicious Network Connections</div>
-        <div class='metric-value'>$($inventory.ThreatAnalysis.SuspiciousConnections.Count)</div>
-        <div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_suspicious_connections.csv' style='color: #721c24;'>View Details</a></div>
-      </div>"
-    })
-    $(if ($inventory.ThreatAnalysis.UnauthorizedAdmins.Count -gt 0) {
-      "<div class='metric danger'>
-        <div class='metric-label'>Unauthorized Admins</div>
-        <div class='metric-value'>$($inventory.ThreatAnalysis.UnauthorizedAdmins.Count)</div>
-        <div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_unauthorized_admins.csv' style='color: #721c24;'>View Details</a></div>
-      </div>"
-    })
-    $(if ($criticalWeaknesses -gt 0) {
-      "<div class='metric danger'>
-        <div class='metric-label'>Critical Security Issues</div>
-        <div class='metric-value'>$criticalWeaknesses</div>
-        <div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/security_weaknesses.csv' style='color: #721c24;'>View Details</a></div>
-      </div>"
-    })
-    $(if ($inventory.ThreatAnalysis.RecentModifications.Count -gt 0) {
-      "<div class='metric warning'>
-        <div class='metric-label'>Recent System File Changes (24h)</div>
-        <div class='metric-value'>$($inventory.ThreatAnalysis.RecentModifications.Count)</div>
-        <div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/recent_system_modifications_24h.csv' style='color: #856404;'>View Details</a></div>
-      </div>"
-    })
-  </div>
-  <div style="margin-top: 20px; padding: 15px; background: rgba(255,255,255,0.3); border-radius: 5px;">
-    <strong>Next Steps:</strong>
-    <ol style="margin: 10px 0;">
-      <li>Review all suspicious items in the CSV files linked above</li>
-      <li>Investigate processes, services, and tasks running from unusual locations</li>
-      <li>Verify all network connections, especially to uncommon ports</li>
-      <li>Check unauthorized administrators and remove if needed</li>
-      <li>Address critical security weaknesses immediately (Defender, Firewall, UAC)</li>
-      <li>Review recent system file modifications for unauthorized changes</li>
-    </ol>
-  </div>
-</div>
-"@
+
+  $threatMetrics = ""
+  if ($inventory.ThreatAnalysis.SuspiciousProcesses.Count -gt 0) {
+    $threatMetrics += "<div class='metric danger'><div class='metric-label'>Suspicious Processes</div><div class='metric-value'>$($inventory.ThreatAnalysis.SuspiciousProcesses.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_suspicious_processes.csv' style='color: #721c24;'>View Details</a></div></div>"
+  }
+  if ($inventory.ThreatAnalysis.SuspiciousServices.Count -gt 0) {
+    $threatMetrics += "<div class='metric danger'><div class='metric-label'>Suspicious Services</div><div class='metric-value'>$($inventory.ThreatAnalysis.SuspiciousServices.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_suspicious_services.csv' style='color: #721c24;'>View Details</a></div></div>"
+  }
+  if ($inventory.ThreatAnalysis.SuspiciousTasks.Count -gt 0) {
+    $threatMetrics += "<div class='metric danger'><div class='metric-label'>Suspicious Scheduled Tasks</div><div class='metric-value'>$($inventory.ThreatAnalysis.SuspiciousTasks.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_suspicious_tasks.csv' style='color: #721c24;'>View Details</a></div></div>"
+  }
+  if ($inventory.ThreatAnalysis.SuspiciousConnections.Count -gt 0) {
+    $threatMetrics += "<div class='metric danger'><div class='metric-label'>Suspicious Network Connections</div><div class='metric-value'>$($inventory.ThreatAnalysis.SuspiciousConnections.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_suspicious_connections.csv' style='color: #721c24;'>View Details</a></div></div>"
+  }
+  if ($inventory.ThreatAnalysis.UnauthorizedAdmins.Count -gt 0) {
+    $threatMetrics += "<div class='metric danger'><div class='metric-label'>Unauthorized Admins</div><div class='metric-value'>$($inventory.ThreatAnalysis.UnauthorizedAdmins.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_unauthorized_admins.csv' style='color: #721c24;'>View Details</a></div></div>"
+  }
+  if ($criticalWeaknesses -gt 0) {
+    $threatMetrics += "<div class='metric danger'><div class='metric-label'>Critical Security Issues</div><div class='metric-value'>$criticalWeaknesses</div><div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/security_weaknesses.csv' style='color: #721c24;'>View Details</a></div></div>"
+  }
+  if ($inventory.ThreatAnalysis.RecentModifications.Count -gt 0) {
+    $threatMetrics += "<div class='metric warning'><div class='metric-label'>Recent System File Changes (24h)</div><div class='metric-value'>$($inventory.ThreatAnalysis.RecentModifications.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/recent_system_modifications_24h.csv' style='color: #856404;'>View Details</a></div></div>"
+  }
+
+  $threatSummary = "<div class='section $threatClass'><h2>[!] CCDC THREAT ANALYSIS - IMMEDIATE ATTENTION REQUIRED</h2><div style='font-size: 1.2em; margin: 15px 0;'><strong>Total Suspicious Items: $totalThreats</strong> | <strong>Critical Security Issues: $criticalWeaknesses</strong></div><div style='display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-top: 20px;'>$threatMetrics</div><div style='margin-top: 20px; padding: 15px; background: rgba(255,255,255,0.3); border-radius: 5px;'><strong>Next Steps:</strong><ol style='margin: 10px 0;'><li>Review all suspicious items in the CSV files linked above</li><li>Investigate processes, services, and tasks running from unusual locations</li><li>Verify all network connections, especially to uncommon ports</li><li>Check unauthorized administrators and remove if needed</li><li>Address critical security weaknesses immediately (Defender, Firewall, UAC)</li><li>Review recent system file modifications for unauthorized changes</li></ol></div></div>"
 }
 
 $summaryMetrics = @"
@@ -2026,12 +1980,7 @@ $artifactLinks += "</ul>"
 
 $errorSection = ""
 if ($inventory.Metadata.ErrorCount -gt 0) {
-  $errorSection = @"
-<div class="section danger">
-  <h2>[!] Collection Errors ($($inventory.Metadata.ErrorCount))</h2>
-  <p>Some data collection operations encountered errors. See <a href="csv/collection_errors.csv">collection_errors.csv</a> for details.</p>
-</div>
-"@
+  $errorSection = "<div class='section danger'><h2>[!] Collection Errors ($($inventory.Metadata.ErrorCount))</h2><p>Some data collection operations encountered errors. See <a href='csv/collection_errors.csv'>collection_errors.csv</a> for details.</p></div>"
 }
 
 $htmlContent = @"
