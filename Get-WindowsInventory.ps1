@@ -2160,7 +2160,7 @@ $totalThreatsConsole = $inventory.ThreatAnalysis.SuspiciousProcesses.Count +
 
 if ($totalThreatsConsole -gt 0) {
   Write-Host ""
-  Write-Host "⚠ THREATS DETECTED: $totalThreatsConsole suspicious items found" -ForegroundColor Red
+  Write-Host "[!] THREATS DETECTED: $totalThreatsConsole suspicious items found" -ForegroundColor Red
   Write-Host ""
 
   if ($inventory.ThreatAnalysis.SuspiciousProcesses.Count -gt 0) {
@@ -2180,12 +2180,12 @@ if ($totalThreatsConsole -gt 0) {
   }
 } else {
   Write-Host ""
-  Write-Host "✓ No immediate threats detected" -ForegroundColor Green
+  Write-Host "[OK] No immediate threats detected" -ForegroundColor Green
 }
 
 if ($inventory.ThreatAnalysis.SecurityWeaknesses.Count -gt 0) {
   Write-Host ""
-  Write-Host "⚠ SECURITY WEAKNESSES: $($inventory.ThreatAnalysis.SecurityWeaknesses.Count) configuration issues found" -ForegroundColor Yellow
+  Write-Host "[!] SECURITY WEAKNESSES: $($inventory.ThreatAnalysis.SecurityWeaknesses.Count) configuration issues found" -ForegroundColor Yellow
 
   # Show critical weaknesses
   if (Test-Path $inventory.ThreatAnalysis.SecurityWeaknesses.Csv) {
@@ -2195,8 +2195,8 @@ if ($inventory.ThreatAnalysis.SecurityWeaknesses.Count -gt 0) {
       Write-Host ""
       Write-Host "  CRITICAL ISSUES:" -ForegroundColor Red
       foreach ($issue in $criticalIssues) {
-        Write-Host "    • $($issue.Issue)" -ForegroundColor Red
-        Write-Host "      → $($issue.Recommendation)" -ForegroundColor White
+        Write-Host "    * $($issue.Issue)" -ForegroundColor Red
+        Write-Host "      > $($issue.Recommendation)" -ForegroundColor White
       }
     }
   }
@@ -2204,12 +2204,12 @@ if ($inventory.ThreatAnalysis.SecurityWeaknesses.Count -gt 0) {
 
 if ($inventory.ThreatAnalysis.RecentModifications.Count -gt 0) {
   Write-Host ""
-  Write-Host "ℹ $($inventory.ThreatAnalysis.RecentModifications.Count) recent system file modifications (last 24h)" -ForegroundColor Cyan
+  Write-Host "[i] $($inventory.ThreatAnalysis.RecentModifications.Count) recent system file modifications (last 24h)" -ForegroundColor Cyan
 }
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "📋 Review the HTML report for detailed threat analysis:" -ForegroundColor White
+Write-Host "Review the HTML report for detailed threat analysis:" -ForegroundColor White
 Write-Host "   $htmlPath" -ForegroundColor Cyan
 Write-Host ""
