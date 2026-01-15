@@ -3110,7 +3110,7 @@ function renderTable(data, containerId, options = {}) {
     html += '<table id=\"' + containerId + '-table\"><thead><tr>';
     headers.forEach(header => {
       const sortClass = sortColumn === header ? ('sorted-' + sortDirection) : 'sortable';
-      html += '<th class=\"' + sortClass + '\" onclick=\"sortTable' + containerId + '(\\'' + header + '\\')'>\">\" + header + '</th>';
+      html += '<th class=\"' + sortClass + '\" onclick=\"sortTable' + containerId + '(\\'' + header + '\\')\">' + header + '</th>';
     });
     html += '</tr></thead><tbody>';
 
