@@ -294,7 +294,7 @@ function Test-SuspiciousProcess {
     $suspicious += "Double extension detected: $path"
   }
 
-  return $suspicious
+  return ,$suspicious
 }
 
 function Test-SuspiciousService {
@@ -318,7 +318,7 @@ function Test-SuspiciousService {
     $suspicious += "Service using encoded commands: $path"
   }
 
-  return $suspicious
+  return ,$suspicious
 }
 
 function Test-SuspiciousScheduledTask {
@@ -342,7 +342,7 @@ function Test-SuspiciousScheduledTask {
     $suspicious += "Non-Microsoft task in Microsoft folder: $($Task.TaskPath)"
   }
 
-  return $suspicious
+  return ,$suspicious
 }
 
 function Test-UnauthorizedAdmin {
@@ -393,7 +393,7 @@ function Get-RecentFileModifications {
     }
   }
 
-  return $modifications
+  return ,$modifications
 }
 
 function Get-SuspiciousNetworkConnections {
@@ -429,7 +429,7 @@ function Get-SuspiciousNetworkConnections {
     }
   }
 
-  return $suspicious
+  return ,$suspicious
 }
 
 function Get-SecurityWeaknesses {
@@ -512,7 +512,7 @@ function Get-SecurityWeaknesses {
     } catch {}
   }
 
-  return $weaknesses
+  return ,$weaknesses
 }
 
 # ---------------------------- Collection Functions ----------------------------
@@ -555,8 +555,13 @@ function Get-SystemSummary {
   }
 
   $lastBoot = $null
-  try { 
+  try {
     $lastBoot = [Management.ManagementDateTimeConverter]::ToDateTime($os.LastBootUpTime)
+  } catch {}
+
+  $installDate = $null
+  try {
+    $installDate = [Management.ManagementDateTimeConverter]::ToDateTime($os.InstallDate)
   } catch {}
 
   $totalMemGB = $null
@@ -574,16 +579,12 @@ function Get-SystemSummary {
     OSVersion            = $os.Version
     OSBuildNumber        = $os.BuildNumber
     OSArchitecture       = $os.OSArchitecture
-    InstallDate          = (try { 
-      [Management.ManagementDateTimeConverter]::ToDateTime($os.InstallDate) 
-    } catch { 
-      $null 
-    })
+    InstallDate          = $installDate
     LastBootUpTime       = $lastBoot
-    UptimeHours          = (if ($lastBoot) { 
-      [math]::Round(((Get-Date) - $lastBoot).TotalHours, 2) 
-    } else { 
-      $null 
+    UptimeHours          = (if ($lastBoot) {
+      [math]::Round(((Get-Date) - $lastBoot).TotalHours, 2)
+    } else {
+      $null
     })
     BIOSVersion          = ($bios.SMBIOSBIOSVersion)
     BIOSSerial           = ($bios.SerialNumber)
@@ -1726,15 +1727,15 @@ if ($secWeaknesses.Count -gt 0) {
   Write-LogEntry "Found $($secWeaknesses.Count) security weaknesses" -Level "WARN"
 
   # Log critical weaknesses to console
-  $critical = $secWeaknesses | Where-Object { $_.Risk -eq 'Critical' }
-  if ($critical) {
+  $critical = @($secWeaknesses | Where-Object { $_.Risk -eq 'Critical' })
+  if ($critical.Count -gt 0) {
     Write-LogEntry "CRITICAL: $($critical.Count) critical security issues found!" -Level "ERROR"
   }
 }
 
 Write-LogEntry "Checking for recent system file modifications (last 24h)"
 $recentMods = Get-RecentFileModifications -Hours 24
-if ($recentMods.Count -gt 0) {
+if ($recentMods -and $recentMods.Count -gt 0) {
   $recentModCsv = Join-Path $csvDir "recent_system_modifications_24h.csv"
   Export-CsvSafe -Data $recentMods -Path $recentModCsv
   $inventory.ThreatAnalysis.RecentModifications.Csv = $recentModCsv
@@ -1881,7 +1882,9 @@ $totalThreats = $inventory.ThreatAnalysis.SuspiciousProcesses.Count +
 $criticalWeaknesses = 0
 if ($inventory.ThreatAnalysis.SecurityWeaknesses.Count -gt 0) {
   $weaknessData = Import-Csv $inventory.ThreatAnalysis.SecurityWeaknesses.Csv -ErrorAction SilentlyContinue
-  $criticalWeaknesses = ($weaknessData | Where-Object { $_.Risk -eq 'Critical' }).Count
+  if ($weaknessData) {
+    $criticalWeaknesses = @($weaknessData | Where-Object { $_.Risk -eq 'Critical' }).Count
+  }
 }
 
 if ($totalThreats -gt 0 -or $criticalWeaknesses -gt 0) {
@@ -1913,6 +1916,10 @@ if ($totalThreats -gt 0 -or $criticalWeaknesses -gt 0) {
   $threatSummary = "<div class='section $threatClass'><h2>[!] CCDC THREAT ANALYSIS - IMMEDIATE ATTENTION REQUIRED</h2><div style='font-size: 1.2em; margin: 15px 0;'><strong>Total Suspicious Items: $totalThreats</strong> | <strong>Critical Security Issues: $criticalWeaknesses</strong></div><div style='display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-top: 20px;'>$threatMetrics</div><div style='margin-top: 20px; padding: 15px; background: rgba(255,255,255,0.3); border-radius: 5px;'><strong>Next Steps:</strong><ol style='margin: 10px 0;'><li>Review all suspicious items in the CSV files linked above</li><li>Investigate processes, services, and tasks running from unusual locations</li><li>Verify all network connections, especially to uncommon ports</li><li>Check unauthorized administrators and remove if needed</li><li>Address critical security weaknesses immediately (Defender, Firewall, UAC)</li><li>Review recent system file modifications for unauthorized changes</li></ol></div></div>"
 }
 
+# Ensure $sys and $sec are valid
+if (-not $sys) { $sys = [pscustomobject]@{} }
+if (-not $sec) { $sec = [pscustomobject]@{ UAC = @{}; RDP_DenyTSConnections = $null } }
+
 $adminClass = if ($sys.IsAdmin) { 'success' } else { 'warning' }
 $adminText = if ($sys.IsAdmin) { 'YES' } else { 'NO' }
 $summaryMetrics = "<div class='metric $adminClass'><div class='metric-label'>Admin Rights</div><div class='metric-value'>$adminText</div></div>"
@@ -1925,23 +1932,23 @@ $summaryMetrics += "<div class='metric'><div class='metric-label'>Patches</div><
 $summaryMetrics += "<div class='metric'><div class='metric-label'>Established Connections</div><div class='metric-value'>$($inventory.EstablishedConnections.Count)</div></div>"
 
 $summaryTable = @(
-  [pscustomobject]@{ Category="System"; Key="Computer Name"; Value=$sys.ComputerName },
-  [pscustomobject]@{ Category="System"; Key="Domain"; Value=$sys.Domain },
-  [pscustomobject]@{ Category="System"; Key="Part of Domain"; Value=$sys.PartOfDomain },
+  [pscustomobject]@{ Category="System"; Key="Computer Name"; Value=($sys.ComputerName) },
+  [pscustomobject]@{ Category="System"; Key="Domain"; Value=($sys.Domain) },
+  [pscustomobject]@{ Category="System"; Key="Part of Domain"; Value=($sys.PartOfDomain) },
   [pscustomobject]@{ Category="System"; Key="Operating System"; Value=("$($sys.OSName) ($($sys.OSArchitecture))") },
   [pscustomobject]@{ Category="System"; Key="OS Version/Build"; Value=("$($sys.OSVersion) / $($sys.OSBuildNumber)") },
-  [pscustomobject]@{ Category="System"; Key="Last Boot"; Value=$sys.LastBootUpTime },
-  [pscustomobject]@{ Category="System"; Key="Uptime (Hours)"; Value=$sys.UptimeHours },
+  [pscustomobject]@{ Category="System"; Key="Last Boot"; Value=($sys.LastBootUpTime) },
+  [pscustomobject]@{ Category="System"; Key="Uptime (Hours)"; Value=($sys.UptimeHours) },
   [pscustomobject]@{ Category="Hardware"; Key="Manufacturer/Model"; Value=("$($sys.Manufacturer) / $($sys.Model)") },
-  [pscustomobject]@{ Category="Hardware"; Key="CPU"; Value=$sys.CPUName },
-  [pscustomobject]@{ Category="Hardware"; Key="CPU Cores"; Value=$sys.CPUCores },
-  [pscustomobject]@{ Category="Hardware"; Key="RAM (GB)"; Value=$sys.TotalMemoryGB },
-  [pscustomobject]@{ Category="Security"; Key="UAC Enabled"; Value=$sec.UAC.EnableLUA },
-  [pscustomobject]@{ Category="Security"; Key="RDP Denied"; Value=$sec.RDP_DenyTSConnections },
-  [pscustomobject]@{ Category="Network"; Key="TCP Connections"; Value=$inventory.Ports.TcpCount },
-  [pscustomobject]@{ Category="Network"; Key="UDP Endpoints"; Value=$inventory.Ports.UdpCount },
-  [pscustomobject]@{ Category="Inventory"; Key="Network Shares"; Value=$inventory.Shares.Count },
-  [pscustomobject]@{ Category="Inventory"; Key="Certificates"; Value=$inventory.Certs.Count }
+  [pscustomobject]@{ Category="Hardware"; Key="CPU"; Value=($sys.CPUName) },
+  [pscustomobject]@{ Category="Hardware"; Key="CPU Cores"; Value=($sys.CPUCores) },
+  [pscustomobject]@{ Category="Hardware"; Key="RAM (GB)"; Value=($sys.TotalMemoryGB) },
+  [pscustomobject]@{ Category="Security"; Key="UAC Enabled"; Value=($sec.UAC.EnableLUA) },
+  [pscustomobject]@{ Category="Security"; Key="RDP Denied"; Value=($sec.RDP_DenyTSConnections) },
+  [pscustomobject]@{ Category="Network"; Key="TCP Connections"; Value=($inventory.Ports.TcpCount) },
+  [pscustomobject]@{ Category="Network"; Key="UDP Endpoints"; Value=($inventory.Ports.UdpCount) },
+  [pscustomobject]@{ Category="Inventory"; Key="Network Shares"; Value=($inventory.Shares.Count) },
+  [pscustomobject]@{ Category="Inventory"; Key="Certificates"; Value=($inventory.Certs.Count) }
 )
 
 $summaryHtml = $summaryTable | ConvertTo-Html -Property Category, Key, Value -Fragment
