@@ -53,6 +53,43 @@ powershell -ExecutionPolicy Bypass -File .\Get-WindowsInventory.ps1 -Quick -Comp
 .\Get-WindowsInventory.ps1 -IncludeEventLogs -Compress
 ```
 
+## 🔄 New: Inventory Diffing
+
+The toolkit now includes **Compare-WindowsInventory.ps1** for detecting changes between inventory snapshots!
+
+### Quick Diff Example
+
+```powershell
+# Take baseline at start of competition
+.\Get-WindowsInventory.ps1 -Quick -OutputRoot C:\CCDC\Baseline
+
+# 30 minutes later, take another snapshot
+.\Get-WindowsInventory.ps1 -Quick
+
+# Compare them
+.\Compare-WindowsInventory.ps1 -BaselinePath C:\CCDC\Baseline\Inventory_* -CurrentPath .\Inventory_*
+```
+
+The diff tool will:
+- ✅ Identify all new/removed processes, services, tasks, users, autoruns
+- ✅ Flag suspicious changes (High/Medium/Low risk)
+- ✅ Generate HTML report with color-coded warnings
+- ✅ Export CSV files for each change category
+- ✅ Highlight critical changes (new admins, suspicious services, C2 connections)
+
+### What Gets Compared
+
+- **Processes**: New/removed processes (flags suspicious paths)
+- **Services**: New/removed services (flags auto-start from user dirs)
+- **Scheduled Tasks**: New/removed tasks (flags encoded PowerShell)
+- **Users**: New/removed accounts
+- **Group Members**: New/removed members (especially Administrators)
+- **Software**: New/removed applications
+- **Autoruns**: New/removed startup items
+- **Network Connections**: New/removed connections (flags C2 ports)
+- **Patches**: New/removed hotfixes
+- **Network Shares**: New/removed shares
+
 ## 📋 CCDC Workflow
 
 ### 1. Initial System Baseline (First 15 minutes)
@@ -94,8 +131,21 @@ Copy-Item Inventory_* C:\CCDC\Baseline\
 # Re-run to detect new changes
 .\Get-WindowsInventory.ps1 -Quick
 
-# Compare with baseline manually or use file comparison tools
+# Compare with baseline using the diff tool
+.\Compare-WindowsInventory.ps1 -BaselinePath C:\CCDC\Baseline\Inventory_* -CurrentPath .\Inventory_*
+
+# Review the diff report
+# Open: InventoryDiff_*/diff_report.html
+# Check: csv/suspicious_changes_summary.csv
 ```
+
+**What to look for in diffs:**
+- New administrator accounts (HIGH PRIORITY)
+- New auto-start services from suspicious locations
+- New scheduled tasks with encoded commands
+- New network connections to unusual ports
+- New autoruns in Run/Startup keys
+- Removed security software or monitoring tools
 
 ## 🔍 Understanding Threat Detection
 
@@ -205,9 +255,147 @@ if ($conn.RemotePort -in @(4444, 5555, 6666, 7777, 8888, 31337, 1337, 8080, 9999
 }
 ```
 
+## 📊 Using Compare-WindowsInventory.ps1
+
+### Basic Usage
+
+```powershell
+# Compare two inventory snapshots
+.\Compare-WindowsInventory.ps1 -BaselinePath .\Inventory_SERVER_20250115_100000 -CurrentPath .\Inventory_SERVER_20250115_110000
+
+# Using wildcards (picks first match)
+.\Compare-WindowsInventory.ps1 -BaselinePath C:\CCDC\Baseline\Inventory_* -CurrentPath .\Inventory_*
+
+# Custom output location
+.\Compare-WindowsInventory.ps1 -BaselinePath .\Old\Inventory_* -CurrentPath .\New\Inventory_* -OutputPath C:\CCDC\Diffs
+```
+
+### Understanding the Output
+
+**Console Output:**
+- Summary of all changes (+Added / -Removed)
+- Count of suspicious changes (High/Medium risk)
+- Direct link to suspicious changes CSV
+
+**HTML Report (diff_report.html):**
+- Prominent "SUSPICIOUS CHANGES DETECTED" section (red background)
+- Change metrics with visual indicators
+- Detailed comparison table
+- Links to all CSV files
+
+**CSV Files (in csv/ folder):**
+- `suspicious_changes_summary.csv` - All flagged changes with risk levels
+- `diff_processes_added.csv` - New processes
+- `diff_services_added.csv` - New services
+- `diff_scheduled_tasks_added.csv` - New scheduled tasks
+- `diff_users_added.csv` - New user accounts
+- `diff_group_members_added.csv` - New group memberships (check Administrators!)
+- `diff_autoruns_added.csv` - New startup items
+- `diff_connections_added.csv` - New network connections
+- `diff_software_added.csv` - New installed software
+- `diff_shares_added.csv` - New network shares
+- `diff_patches_added.csv` - New patches/hotfixes
+- *(Also includes `*_removed.csv` for each category)*
+
+### Suspicion Levels
+
+**High Risk (Red):**
+- Processes from temp/appdata/public directories
+- Auto-start services from user directories
+- SYSTEM services from suspicious paths
+- Scheduled tasks with encoded/hidden PowerShell
+- Network connections to C2 ports (4444, 1337, etc.)
+- New members added to Administrators group
+
+**Medium Risk (Yellow):**
+- Script interpreters (PowerShell, cmd, wscript) - *May be legitimate*
+- New user accounts
+- New autoruns in Run/Startup keys
+- New network shares
+- Unusual processes with network connections
+
+**Low Risk (Blue):**
+- Standard processes/services
+- Expected software installations
+
+### CCDC Diff Workflow
+
+**Step 1: Immediate Review**
+```powershell
+# Open the HTML report first
+Invoke-Item .\InventoryDiff_*\diff_report.html
+```
+
+**Step 2: Prioritize High Risk**
+```powershell
+# View all suspicious changes
+Import-Csv .\InventoryDiff_*\csv\suspicious_changes_summary.csv | Where-Object SuspicionLevel -eq "High" | Format-Table
+```
+
+**Step 3: Investigate Categories**
+```powershell
+# Check new administrators (CRITICAL)
+Import-Csv .\InventoryDiff_*\csv\diff_group_members_added.csv | Where-Object Group -match "Admin"
+
+# Check new services
+Import-Csv .\InventoryDiff_*\csv\diff_services_added.csv | Format-Table
+
+# Check new scheduled tasks
+Import-Csv .\InventoryDiff_*\csv\diff_scheduled_tasks_added.csv | Format-Table
+```
+
+**Step 4: Take Action**
+- Kill malicious processes
+- Stop and disable malicious services
+- Remove unauthorized admin accounts
+- Disable malicious scheduled tasks
+- Block suspicious network connections
+
+### Example Suspicious Findings
+
+**New Administrator Account:**
+```
+Category: GroupMember
+Change: Added
+Item: hackerman → Administrators
+SuspicionLevel: High
+```
+**Action:** `net localgroup Administrators hackerman /delete`
+
+**New Auto-Start Service:**
+```
+Category: Service
+Change: Added
+Item: WindowsUpdateHelper (WinUpdate)
+Details: Path: C:\Users\Public\svchost.exe, StartMode: Auto
+SuspicionLevel: High
+```
+**Action:**
+```powershell
+Stop-Service WinUpdate
+sc.exe delete WinUpdate
+Remove-Item C:\Users\Public\svchost.exe -Force
+```
+
+**New Network Connection to C2 Port:**
+```
+Category: NetworkConnection
+Change: Added
+Item: powershell.exe → 192.168.1.100:4444
+SuspicionLevel: High
+```
+**Action:**
+```powershell
+# Find and kill the process
+Get-Process powershell | Where-Object {$_.Id -eq <PID>} | Stop-Process -Force
+
+# Block the IP
+New-NetFirewallRule -DisplayName "Block-C2" -Direction Outbound -RemoteAddress 192.168.1.100 -Action Block
+```
+
 ## 🛡️ CCDC Defense Checklist
 
-Use this script as part of your defense strategy:
+Use these tools as part of your defense strategy:
 
 - [ ] Run inventory on all systems within first 15 minutes
 - [ ] Review threat analysis section immediately
@@ -220,6 +408,9 @@ Use this script as part of your defense strategy:
 - [ ] Review recent file modifications
 - [ ] Save baseline for comparison
 - [ ] Re-run periodically to detect changes
+- [ ] **Use Compare-WindowsInventory.ps1 to diff snapshots**
+- [ ] Review suspicious changes in diff reports
+- [ ] Investigate and respond to High/Medium risk changes
 - [ ] Document all findings in incident log
 
 ## ⚡ Performance Tips
@@ -304,7 +495,8 @@ Import-Csv .\csv\security_weaknesses.csv | Where-Object Risk -eq 'Critical'
 
 ## 📝 Version History
 
-### v2.1 (CCDC Enhanced Edition)
+### v2.1 (CCDC Enhanced Edition) - 2025-01-15
+**Get-WindowsInventory.ps1:**
 - Added automated threat detection for processes, services, tasks, connections
 - Added security weakness identification
 - Added unauthorized administrator detection
@@ -312,6 +504,14 @@ Import-Csv .\csv\security_weaknesses.csv | Where-Object Risk -eq 'Critical'
 - Enhanced HTML report with prominent threat analysis
 - Added console threat summary output
 - Created CCDC-specific documentation
+
+**Compare-WindowsInventory.ps1 (NEW):**
+- Inventory diffing tool for change detection
+- Compares snapshots to identify additions/removals
+- Flags suspicious changes with risk levels (High/Medium/Low)
+- Generates HTML diff report with color-coded warnings
+- Exports detailed CSV files for each change category
+- Highlights critical changes (new admins, suspicious services, C2 connections)
 
 ### v2.0 (Original)
 - Comprehensive Windows inventory collection
