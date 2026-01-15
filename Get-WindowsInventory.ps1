@@ -1,0 +1,1668 @@
+<#
+.SYNOPSIS
+  Comprehensive Windows system inventory (read-only) for blue-team baselining and triage.
+
+.DESCRIPTION
+  Collects OS/hardware/storage/network/security/software/services/processes/scheduled tasks/
+  firewall/open ports/shares/certificates/patches/policies/persistence/autoruns and exports:
+    - inventory.json (summary + file references)
+    - multiple CSVs for list-style data (software/services/processes/tasks/firewall/etc.)
+    - system_report.html (enhanced readable summary)
+    - text artifacts (route/arp/netstat/systeminfo)
+    - collection.log (execution log with errors)
+
+  Designed to run on PowerShell 5.1+ without external modules.
+  Degrades gracefully if certain cmdlets are missing.
+
+.PARAMETER OutputRoot
+  Base directory for report output (default: current directory).
+
+.PARAMETER Quick
+  Skip expensive/verbose collections (e.g., AppX packages, full firewall rule export, cert enumeration).
+
+.PARAMETER IncludeEventLogs
+  Include a small event log summary (last 24 hours) from System and Security. Can be slower.
+
+.PARAMETER Software
+  Include installed software inventory (registry + AppX if available). Disable with -Software:$false.
+
+.PARAMETER Firewall
+  Include firewall rules export. Disable with -Firewall:$false.
+
+.PARAMETER Certs
+  Include LocalMachine certificate inventory. Disable with -Certs:$false.
+
+.PARAMETER Compress
+  Compress the output folder into a ZIP archive after collection.
+
+.PARAMETER NoProgress
+  Disable progress indicators (useful for scripted/automated runs).
+
+.EXAMPLE
+  powershell -ExecutionPolicy Bypass -File .\Get-WindowsInventory.ps1
+
+.EXAMPLE
+  .\Get-WindowsInventory.ps1 -OutputRoot C:\IR -IncludeEventLogs -Quick -Compress
+
+.NOTES
+  Run as Administrator for best coverage (SecurityCenter2, some registry keys, firewall rules, etc.).
+  Version: 2.0
+#>
+
+[CmdletBinding()]
+param(
+  [string]$OutputRoot = (Get-Location).Path,
+  [switch]$Quick,
+  [switch]$IncludeEventLogs,
+  [bool]$Software = $true,
+  [bool]$Firewall = $true,
+  [bool]$Certs = $true,
+  [switch]$Compress,
+  [switch]$NoProgress
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Continue'
+
+# Script-level variables
+$script:LogPath = $null
+$script:ErrorLog = @()
+$script:StartTime = Get-Date
+$script:TotalSteps = 20
+$script:CurrentStep = 0
+
+# ---------------------------- Helpers ----------------------------
+
+function Write-ProgressSafe {
+  param(
+    [Parameter(Mandatory)][string]$Activity,
+    [Parameter(Mandatory)][string]$Status,
+    [int]$PercentComplete = 0
+  )
+  
+  if (-not $NoProgress) {
+    try {
+      Write-Progress -Activity $Activity -Status $Status -PercentComplete $PercentComplete
+    } catch {}
+  }
+}
+
+function Update-Progress {
+  param([string]$Status)
+  
+  $script:CurrentStep++
+  $percent = [math]::Min(100, [int](($script:CurrentStep / $script:TotalSteps) * 100))
+  Write-ProgressSafe -Activity "Windows Inventory Collection" -Status $Status -PercentComplete $percent
+}
+
+function Write-LogEntry {
+  param(
+    [Parameter(Mandatory)][string]$Message,
+    [string]$Level = "INFO"
+  )
+  
+  $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+  $logEntry = "[$timestamp] [$Level] $Message"
+  
+  # Console output
+  switch ($Level) {
+    "ERROR" { Write-Host $logEntry -ForegroundColor Red }
+    "WARN"  { Write-Host $logEntry -ForegroundColor Yellow }
+    "SUCCESS" { Write-Host $logEntry -ForegroundColor Green }
+    default { Write-Host $logEntry }
+  }
+  
+  # File output
+  if ($script:LogPath) {
+    try {
+      $logEntry | Out-File -Append -FilePath $script:LogPath -Encoding UTF8 -ErrorAction SilentlyContinue
+    } catch {}
+  }
+}
+
+function Add-ErrorEntry {
+  param(
+    [Parameter(Mandatory)][string]$Function,
+    [Parameter(Mandatory)][string]$Error
+  )
+  
+  $script:ErrorLog += [pscustomobject]@{
+    Timestamp = Get-Date
+    Function = $Function
+    Error = $Error
+  }
+  
+  Write-LogEntry -Message "Error in $Function : $Error" -Level "ERROR"
+}
+
+function Test-Command {
+  param([Parameter(Mandatory)][string]$Name)
+  return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+function New-ReportFolder {
+  param([string]$Root)
+
+  $ts = Get-Date -Format "yyyyMMdd_HHmmss"
+  $hostName = $env:COMPUTERNAME
+  $dir = Join-Path $Root "Inventory_${hostName}_$ts"
+
+  New-Item -ItemType Directory -Path $dir -Force | Out-Null
+  New-Item -ItemType Directory -Path (Join-Path $dir "artifacts") -Force | Out-Null
+  New-Item -ItemType Directory -Path (Join-Path $dir "csv") -Force | Out-Null
+  
+  # Initialize log file
+  $script:LogPath = Join-Path $dir "collection.log"
+  
+  return $dir
+}
+
+function Write-TextFile {
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$Content
+  )
+  $Content | Out-File -FilePath $Path -Encoding UTF8 -Force
+}
+
+function Export-CsvSafe {
+  param(
+    [Parameter(Mandatory)][object[]]$Data,
+    [Parameter(Mandatory)][string]$Path
+  )
+  if ($null -eq $Data -or $Data.Count -eq 0) {
+    "" | Out-File -FilePath $Path -Encoding UTF8 -Force
+    return
+  }
+  $Data | Export-Csv -NoTypeInformation -Encoding UTF8 -Force -Path $Path
+}
+
+function Get-FileHashSafe {
+  param([string]$Path)
+  try {
+    if (Test-Path $Path) {
+      if (Test-Command "Get-FileHash") {
+        return (Get-FileHash -Algorithm SHA256 -Path $Path).Hash
+      } else {
+        # Fallback: certutil
+        $out = certutil -hashfile $Path SHA256 2>$null
+        return ($out | Select-String -Pattern '^[0-9A-Fa-f]{64}$').Line
+      }
+    }
+  } catch {}
+  return $null
+}
+
+function Get-RegistryValueSafe {
+  param([string]$Path, [string]$Name)
+  try {
+    $item = Get-ItemProperty -Path $Path -ErrorAction Stop
+    return $item.$Name
+  } catch {
+    return $null
+  }
+}
+
+function Invoke-ExeCapture {
+  param(
+    [Parameter(Mandatory)][string]$File,
+    [string[]]$Args = @()
+  )
+  try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $File
+    $psi.Arguments = ($Args -join ' ')
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = $psi
+    [void]$p.Start()
+    $stdout = $p.StandardOutput.ReadToEnd()
+    $stderr = $p.StandardError.ReadToEnd()
+    $p.WaitForExit()
+
+    return [pscustomobject]@{
+      ExitCode = $p.ExitCode
+      StdOut   = $stdout
+      StdErr   = $stderr
+    }
+  } catch {
+    return [pscustomobject]@{ 
+      ExitCode = 1
+      StdOut = ""
+      StdErr = $_.Exception.Message 
+    }
+  }
+}
+
+function Is-Admin {
+  try {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p = New-Object Security.Principal.WindowsPrincipal($id)
+    return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  } catch { 
+    return $false 
+  }
+}
+
+function Compress-ReportFolder {
+  param([string]$FolderPath)
+  
+  try {
+    $zipPath = "$FolderPath.zip"
+    
+    if (Test-Command "Compress-Archive") {
+      Write-LogEntry "Compressing report folder..."
+      Compress-Archive -Path $FolderPath -DestinationPath $zipPath -CompressionLevel Optimal -Force
+      Write-LogEntry "Compressed report: $zipPath" -Level "SUCCESS"
+      return $zipPath
+    } else {
+      Write-LogEntry "Compress-Archive not available, skipping compression" -Level "WARN"
+    }
+  } catch {
+    Write-LogEntry "Failed to compress: $_" -Level "ERROR"
+    Add-ErrorEntry -Function "Compress-ReportFolder" -Error $_.Exception.Message
+  }
+  
+  return $null
+}
+
+# ---------------------------- Collection Functions ----------------------------
+
+function Get-SystemSummary {
+  $os = $null
+  $cs = $null
+  $bios = $null
+  $cpu = $null
+  $mem = $null
+
+  try { 
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+  } catch {
+    Add-ErrorEntry -Function "Get-SystemSummary" -Error "Failed to get OS info: $_"
+  }
+  
+  try { 
+    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+  } catch {
+    Add-ErrorEntry -Function "Get-SystemSummary" -Error "Failed to get computer system info: $_"
+  }
+  
+  try { 
+    $bios = Get-CimInstance Win32_BIOS -ErrorAction Stop
+  } catch {
+    Add-ErrorEntry -Function "Get-SystemSummary" -Error "Failed to get BIOS info: $_"
+  }
+  
+  try { 
+    $cpu = Get-CimInstance Win32_Processor -ErrorAction Stop
+  } catch {
+    Add-ErrorEntry -Function "Get-SystemSummary" -Error "Failed to get CPU info: $_"
+  }
+  
+  try { 
+    $mem = Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop
+  } catch {
+    Add-ErrorEntry -Function "Get-SystemSummary" -Error "Failed to get memory info: $_"
+  }
+
+  $lastBoot = $null
+  try { 
+    $lastBoot = [Management.ManagementDateTimeConverter]::ToDateTime($os.LastBootUpTime)
+  } catch {}
+
+  $totalMemGB = $null
+  try {
+    $totalMemGB = [math]::Round(($cs.TotalPhysicalMemory / 1GB), 2)
+  } catch {}
+
+  return [pscustomobject]@{
+    ComputerName         = $env:COMPUTERNAME
+    Domain               = $cs.Domain
+    PartOfDomain         = $cs.PartOfDomain
+    Manufacturer         = $cs.Manufacturer
+    Model                = $cs.Model
+    OSName               = $os.Caption
+    OSVersion            = $os.Version
+    OSBuildNumber        = $os.BuildNumber
+    OSArchitecture       = $os.OSArchitecture
+    InstallDate          = (try { 
+      [Management.ManagementDateTimeConverter]::ToDateTime($os.InstallDate) 
+    } catch { 
+      $null 
+    })
+    LastBootUpTime       = $lastBoot
+    UptimeHours          = (if ($lastBoot) { 
+      [math]::Round(((Get-Date) - $lastBoot).TotalHours, 2) 
+    } else { 
+      $null 
+    })
+    BIOSVersion          = ($bios.SMBIOSBIOSVersion)
+    BIOSSerial           = ($bios.SerialNumber)
+    CPUName              = ($cpu | Select-Object -First 1 -ExpandProperty Name)
+    CPUCores             = ($cpu | Measure-Object -Property NumberOfCores -Sum).Sum
+    CPULogicalProcessors = ($cpu | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+    TotalMemoryGB        = $totalMemGB
+    IsAdmin              = (Is-Admin)
+    TimeCollected        = (Get-Date).ToString("o")
+  }
+}
+
+function Get-StorageInfo {
+  $disks = @()
+  $vols  = @()
+
+  try {
+    $disks = Get-CimInstance Win32_DiskDrive -ErrorAction Stop | Select-Object `
+      Model, InterfaceType, MediaType, SerialNumber, Size, Partitions
+  } catch {
+    Add-ErrorEntry -Function "Get-StorageInfo" -Error "Failed to get disk info: $_"
+  }
+
+  try {
+    $vols = Get-CimInstance Win32_LogicalDisk -ErrorAction Stop | Select-Object `
+      DeviceID, VolumeName, FileSystem, Size, FreeSpace, DriveType
+  } catch {
+    Add-ErrorEntry -Function "Get-StorageInfo" -Error "Failed to get volume info: $_"
+  }
+
+  return [pscustomobject]@{
+    Disks   = $disks
+    Volumes = $vols
+  }
+}
+
+function Get-NetworkInfo {
+  $ipcfg = $null
+  $adapters = @()
+  $dns = @()
+  $routesTxt = ""
+  $arpTxt = ""
+
+  if (Test-Command "Get-NetIPConfiguration") {
+    try { 
+      $ipcfg = Get-NetIPConfiguration -ErrorAction Stop
+    } catch {
+      Add-ErrorEntry -Function "Get-NetworkInfo" -Error "Failed to get NetIPConfiguration: $_"
+    }
+  }
+
+  try {
+    $adapters = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=TRUE" -ErrorAction Stop |
+      Select-Object Description, MACAddress, DHCPEnabled, DHCPServer, IPAddress, IPSubnet, DefaultIPGateway, DNSServerSearchOrder
+  } catch {
+    Add-ErrorEntry -Function "Get-NetworkInfo" -Error "Failed to get network adapters: $_"
+  }
+
+  if (Test-Command "Get-DnsClientServerAddress") {
+    try { 
+      $dns = Get-DnsClientServerAddress -ErrorAction Stop | 
+        Select-Object InterfaceAlias, AddressFamily, ServerAddresses 
+    } catch {
+      Add-ErrorEntry -Function "Get-NetworkInfo" -Error "Failed to get DNS servers: $_"
+    }
+  }
+
+  $routesTxt = (Invoke-ExeCapture -File "route" -Args @("print")).StdOut
+  $arpTxt    = (Invoke-ExeCapture -File "arp"   -Args @("-a")).StdOut
+
+  return [pscustomobject]@{
+    NetIPConfigurationAvailable = [bool]$ipcfg
+    NetIPConfiguration          = $ipcfg
+    IPEnabledAdapters           = $adapters
+    DnsClientServers            = $dns
+    RoutesText                  = $routesTxt
+    ArpText                     = $arpTxt
+  }
+}
+
+function Get-DNSCache {
+  $cache = @()
+  
+  if (Test-Command "Get-DnsClientCache") {
+    try {
+      $cache = Get-DnsClientCache -ErrorAction Stop | 
+        Select-Object Entry, RecordName, RecordType, Data, TimeToLive
+    } catch {
+      Add-ErrorEntry -Function "Get-DNSCache" -Error "Failed to get DNS cache: $_"
+    }
+  } else {
+    $raw = (Invoke-ExeCapture -File "ipconfig" -Args @("/displaydns")).StdOut
+    $cache = @([pscustomobject]@{ Note="ipconfig /displaydns raw"; Raw=$raw })
+  }
+  
+  return $cache
+}
+
+function Get-OpenPortsAndNetstat {
+  $tcp = @()
+  $udp = @()
+  $netstatTxt = ""
+
+  if (Test-Command "Get-NetTCPConnection") {
+    try {
+      $tcp = Get-NetTCPConnection -ErrorAction Stop | Select-Object `
+        LocalAddress, LocalPort, RemoteAddress, RemotePort, State, OwningProcess
+    } catch {
+      Add-ErrorEntry -Function "Get-OpenPortsAndNetstat" -Error "Failed to get TCP connections: $_"
+    }
+  } else {
+    $netstatTxt = (Invoke-ExeCapture -File "netstat" -Args @("-ano")).StdOut
+  }
+
+  if (Test-Command "Get-NetUDPEndpoint") {
+    try {
+      $udp = Get-NetUDPEndpoint -ErrorAction Stop | Select-Object `
+        LocalAddress, LocalPort, OwningProcess
+    } catch {
+      Add-ErrorEntry -Function "Get-OpenPortsAndNetstat" -Error "Failed to get UDP endpoints: $_"
+    }
+  }
+
+  if (-not $netstatTxt) {
+    $netstatTxt = (Invoke-ExeCapture -File "netstat" -Args @("-ano")).StdOut
+  }
+
+  return [pscustomobject]@{
+    TcpConnections = $tcp
+    UdpEndpoints   = $udp
+    NetstatText    = $netstatTxt
+  }
+}
+
+function Get-NetworkConnectionsEnhanced {
+  $connections = @()
+  
+  if (Test-Command "Get-NetTCPConnection") {
+    try {
+      $allConnections = Get-NetTCPConnection -ErrorAction Stop | 
+        Where-Object State -eq 'Established'
+      
+      foreach ($conn in $allConnections) {
+        $proc = $null
+        try {
+          $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
+        } catch {}
+        
+        $connections += [pscustomobject]@{
+          LocalAddress = $conn.LocalAddress
+          LocalPort = $conn.LocalPort
+          RemoteAddress = $conn.RemoteAddress
+          RemotePort = $conn.RemotePort
+          State = $conn.State
+          ProcessId = $conn.OwningProcess
+          ProcessName = if ($proc) { $proc.Name } else { $null }
+          ProcessPath = if ($proc) { $proc.Path } else { $null }
+        }
+      }
+    } catch {
+      Add-ErrorEntry -Function "Get-NetworkConnectionsEnhanced" -Error "Failed to get enhanced connections: $_"
+    }
+  }
+  
+  return $connections
+}
+
+function Get-ServicesAndProcesses {
+  $services = @()
+  $processes = @()
+
+  try {
+    $services = Get-CimInstance Win32_Service -ErrorAction Stop | Select-Object `
+      Name, DisplayName, State, StartMode, StartName, PathName, ProcessId
+  } catch {
+    Add-ErrorEntry -Function "Get-ServicesAndProcesses" -Error "Failed to get services: $_"
+  }
+
+  try {
+    $processes = Get-Process -ErrorAction Stop | Select-Object `
+      Name, Id, CPU, WS, StartTime, Path, @{n='CommandLine';e={
+        try {
+          (Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)" -ErrorAction SilentlyContinue).CommandLine
+        } catch { $null }
+      }}
+  } catch {
+    # Fallback to WMI
+    try {
+      $processes = Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object `
+        Name, ProcessId, ExecutablePath, CommandLine, CreationDate
+    } catch {
+      Add-ErrorEntry -Function "Get-ServicesAndProcesses" -Error "Failed to get processes: $_"
+    }
+  }
+
+  return [pscustomobject]@{
+    Services  = $services
+    Processes = $processes
+  }
+}
+
+function Get-LocalUsersAndGroups {
+  $users = @()
+  $groups = @()
+  $groupMembers = @()
+
+  if (Test-Command "Get-LocalUser") {
+    try { 
+      $users = Get-LocalUser -ErrorAction Stop | 
+        Select-Object Name, Enabled, LastLogon, PasswordLastSet, PasswordExpires, UserMayChangePassword, Description 
+    } catch {
+      Add-ErrorEntry -Function "Get-LocalUsersAndGroups" -Error "Failed to get local users: $_"
+    }
+    
+    try { 
+      $groups = Get-LocalGroup -ErrorAction Stop | 
+        Select-Object Name, Description 
+    } catch {
+      Add-ErrorEntry -Function "Get-LocalUsersAndGroups" -Error "Failed to get local groups: $_"
+    }
+    
+    try {
+      foreach ($g in (Get-LocalGroup -ErrorAction Stop)) {
+        $m = @()
+        try { 
+          $m = Get-LocalGroupMember -Group $g.Name -ErrorAction Stop 
+        } catch {}
+        
+        foreach ($mm in $m) {
+          $groupMembers += [pscustomobject]@{ 
+            Group = $g.Name
+            Member = $mm.Name
+            ObjectClass = $mm.ObjectClass
+            PrincipalSource = $mm.PrincipalSource 
+          }
+        }
+      }
+    } catch {
+      Add-ErrorEntry -Function "Get-LocalUsersAndGroups" -Error "Failed to get group members: $_"
+    }
+  } else {
+    # Fallback for older OS: ADSI
+    try {
+      $adsi = [ADSI]"WinNT://$env:COMPUTERNAME"
+      foreach ($child in $adsi.Children) {
+        if ($child.SchemaClassName -eq "User") {
+          $users += [pscustomobject]@{
+            Name        = $child.Name
+            Enabled     = (try { -not [bool]$child.AccountDisabled } catch { $null })
+            Description = (try { $child.Description } catch { $null })
+          }
+        }
+        if ($child.SchemaClassName -eq "Group") {
+          $groups += [pscustomobject]@{
+            Name        = $child.Name
+            Description = (try { $child.Description } catch { $null })
+          }
+        }
+      }
+      
+      foreach ($g in $groups) {
+        try {
+          $grp = [ADSI]"WinNT://$env:COMPUTERNAME/$($g.Name),group"
+          $members = @($grp.psbase.Invoke("Members"))
+          foreach ($m in $members) {
+            $name = $m.GetType().InvokeMember("Name",'GetProperty',$null,$m,$null)
+            $groupMembers += [pscustomobject]@{ 
+              Group = $g.Name
+              Member = $name
+              ObjectClass = "Unknown"
+              PrincipalSource = "WinNT" 
+            }
+          }
+        } catch {}
+      }
+    } catch {
+      Add-ErrorEntry -Function "Get-LocalUsersAndGroups" -Error "Failed to enumerate via ADSI: $_"
+    }
+  }
+
+  return [pscustomobject]@{
+    Users        = $users
+    Groups       = $groups
+    GroupMembers = $groupMembers
+  }
+}
+
+function Get-ScheduledTasksInfo {
+  $tasks = @()
+
+  if (Test-Command "Get-ScheduledTask") {
+    try {
+      $tasks = Get-ScheduledTask -ErrorAction Stop | ForEach-Object {
+        $info = $null
+        try { 
+          $info = Get-ScheduledTaskInfo -TaskName $_.TaskName -TaskPath $_.TaskPath -ErrorAction SilentlyContinue
+        } catch {}
+        
+        [pscustomobject]@{
+          TaskName     = $_.TaskName
+          TaskPath     = $_.TaskPath
+          State        = $_.State
+          Author       = $_.Author
+          Description  = $_.Description
+          Actions      = (($_.Actions | ForEach-Object { 
+            "$($_.Execute) $($_.Arguments)" 
+          }) -join "; ")
+          Triggers     = (($_.Triggers | ForEach-Object { 
+            $_.ToString() 
+          }) -join "; ")
+          LastRunTime  = (if ($info) { $info.LastRunTime } else { $null })
+          NextRunTime  = (if ($info) { $info.NextRunTime } else { $null })
+          LastTaskResult = (if ($info) { $info.LastTaskResult } else { $null })
+        }
+      }
+    } catch {
+      Add-ErrorEntry -Function "Get-ScheduledTasksInfo" -Error "Failed to get scheduled tasks: $_"
+    }
+  } else {
+    # Fallback: schtasks verbose CSV
+    $raw = (Invoke-ExeCapture -File "schtasks.exe" -Args @("/query","/fo","csv","/v")).StdOut
+    try {
+      $tasks = $raw | ConvertFrom-Csv | Select-Object `
+        "TaskName","Status","Author","Task To Run","Start In","Schedule Type",
+        "Start Time","Start Date","End Date","Days","Months","Next Run Time",
+        "Last Run Time","Last Result","Run As User"
+    } catch {
+      $tasks = @([pscustomobject]@{ 
+        Note="schtasks output not parsed"
+        Raw=$raw 
+      })
+      Add-ErrorEntry -Function "Get-ScheduledTasksInfo" -Error "Failed to parse schtasks output"
+    }
+  }
+
+  return $tasks
+}
+
+function Get-AutorunsInfo {
+  $autoruns = @()
+  
+  # Startup folders
+  $paths = @(
+    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup",
+    "$env:AppData\Microsoft\Windows\Start Menu\Programs\Startup",
+    "$env:ALLUSERSPROFILE\Microsoft\Windows\Start Menu\Programs\Startup"
+  )
+  
+  foreach ($p in $paths) {
+    if (Test-Path $p) {
+      try {
+        $items = Get-ChildItem $p -ErrorAction Stop
+        foreach ($item in $items) {
+          $autoruns += [pscustomobject]@{
+            Location = $p
+            Type = "StartupFolder"
+            Name = $item.Name
+            Value = $item.FullName
+            CreationTime = $item.CreationTime
+            LastWriteTime = $item.LastWriteTime
+            Hash = (Get-FileHashSafe $item.FullName)
+          }
+        }
+      } catch {}
+    }
+  }
+  
+  # Registry Run keys
+  $runKeys = @(
+    "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
+    "HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+    "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run",
+    "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+    "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
+    "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce"
+  )
+  
+  foreach ($k in $runKeys) {
+    try {
+      if (Test-Path $k) {
+        $props = Get-ItemProperty $k -ErrorAction Stop
+        $props.PSObject.Properties | Where-Object { 
+          $_.Name -notlike 'PS*' 
+        } | ForEach-Object {
+          $autoruns += [pscustomobject]@{
+            Location = $k
+            Type = "Registry"
+            Name = $_.Name
+            Value = $_.Value
+            CreationTime = $null
+            LastWriteTime = $null
+            Hash = $null
+          }
+        }
+      }
+    } catch {}
+  }
+  
+  return $autoruns
+}
+
+function Get-PersistenceLocations {
+  $wmiEvents = @()
+  $suspiciousServices = @()
+  
+  # WMI Event Consumers (common persistence)
+  try {
+    $wmiEvents = Get-CimInstance -Namespace "root/subscription" -ClassName "__EventFilter" -ErrorAction Stop |
+      Select-Object Name, Query, EventNamespace
+  } catch {
+    Add-ErrorEntry -Function "Get-PersistenceLocations" -Error "Failed to get WMI event filters: $_"
+  }
+  
+  # Services with suspicious paths
+  try {
+    $suspiciousServices = Get-CimInstance Win32_Service -ErrorAction Stop | 
+      Where-Object { 
+        $_.PathName -match '(temp|appdata|public|programdata|users)' -and 
+        $_.StartMode -eq 'Auto' 
+      } | Select-Object Name, DisplayName, PathName, StartMode, State, StartName
+  } catch {
+    Add-ErrorEntry -Function "Get-PersistenceLocations" -Error "Failed to check suspicious services: $_"
+  }
+  
+  return [pscustomobject]@{
+    WMIEventFilters = $wmiEvents
+    SuspiciousServices = $suspiciousServices
+  }
+}
+
+function Get-InstalledSoftware {
+  $sw = @()
+
+  # Registry-based uninstall keys (64-bit and 32-bit)
+  $paths = @(
+    "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+  )
+
+  foreach ($p in $paths) {
+    try {
+      $items = Get-ItemProperty $p -ErrorAction SilentlyContinue
+      foreach ($i in $items) {
+        if ([string]::IsNullOrWhiteSpace($i.DisplayName)) { continue }
+        $sw += [pscustomobject]@{
+          DisplayName     = $i.DisplayName
+          DisplayVersion  = $i.DisplayVersion
+          Publisher       = $i.Publisher
+          InstallDate     = $i.InstallDate
+          InstallLocation = $i.InstallLocation
+          UninstallString = $i.UninstallString
+          Source          = $p.Replace("\*","")
+        }
+      }
+    } catch {}
+  }
+
+  # AppX packages (optional; can be large)
+  $appx = @()
+  if (-not $Quick -and (Test-Command "Get-AppxPackage")) {
+    try {
+      $appx = Get-AppxPackage -ErrorAction Stop | 
+        Select-Object Name, PackageFullName, Publisher, Version, InstallLocation
+    } catch {
+      Add-ErrorEntry -Function "Get-InstalledSoftware" -Error "Failed to get AppX packages: $_"
+    }
+  }
+
+  return [pscustomobject]@{
+    UninstallRegistry = $sw
+    AppxPackages      = $appx
+  }
+}
+
+function Get-PatchInfo {
+  $hotfix = @()
+  try {
+    $hotfix = Get-HotFix -ErrorAction Stop | 
+      Select-Object HotFixID, Description, InstalledBy, InstalledOn
+  } catch {
+    Add-ErrorEntry -Function "Get-PatchInfo" -Error "Failed to get hotfix info: $_"
+  }
+  return $hotfix
+}
+
+function Get-FirewallInfo {
+  $rules = @()
+  $profiles = @()
+  $raw = ""
+
+  if (Test-Command "Get-NetFirewallRule") {
+    try {
+      $profiles = Get-NetFirewallProfile -ErrorAction Stop | 
+        Select-Object Name, Enabled, DefaultInboundAction, DefaultOutboundAction, 
+          NotifyOnListen, AllowInboundRules, AllowLocalFirewallRules
+    } catch {
+      Add-ErrorEntry -Function "Get-FirewallInfo" -Error "Failed to get firewall profiles: $_"
+    }
+    
+    try {
+      $rules = Get-NetFirewallRule -ErrorAction Stop | 
+        Select-Object DisplayName, Enabled, Direction, Action, Profile, 
+          Group, PolicyStoreSource, Owner
+    } catch {
+      Add-ErrorEntry -Function "Get-FirewallInfo" -Error "Failed to get firewall rules: $_"
+    }
+  } else {
+    $raw = (Invoke-ExeCapture -File "netsh" -Args @("advfirewall","firewall","show","rule","name=all")).StdOut
+  }
+
+  return [pscustomobject]@{
+    Profiles     = $profiles
+    Rules        = $rules
+    NetshRawText = $raw
+  }
+}
+
+function Get-SecurityPosture {
+  # Defender (if present)
+  $def = $null
+  if (Test-Command "Get-MpComputerStatus") {
+    try { 
+      $def = Get-MpComputerStatus -ErrorAction Stop
+    } catch {
+      Add-ErrorEntry -Function "Get-SecurityPosture" -Error "Failed to get Defender status: $_"
+    }
+  }
+
+  # Security Center AV products
+  $av = @()
+  try {
+    $av = Get-CimInstance -Namespace "root/SecurityCenter2" -ClassName "AntiVirusProduct" -ErrorAction Stop |
+      Select-Object displayName, pathToSignedProductExe, productState, timestamp
+  } catch {
+    # Might not exist on servers or older systems
+  }
+
+  # UAC settings
+  $uac = [pscustomobject]@{
+    EnableLUA                 = Get-RegistryValueSafe "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "EnableLUA"
+    ConsentPromptBehaviorAdmin= Get-RegistryValueSafe "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "ConsentPromptBehaviorAdmin"
+    PromptOnSecureDesktop     = Get-RegistryValueSafe "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "PromptOnSecureDesktop"
+  }
+
+  # RDP status
+  $rdpDeny = Get-RegistryValueSafe "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" "fDenyTSConnections"
+
+  # SMB settings
+  $smb1 = $null
+  $smbSrv = $null
+  if (Test-Command "Get-SmbServerConfiguration") {
+    try { 
+      $smbSrv = Get-SmbServerConfiguration -ErrorAction Stop | 
+        Select-Object EnableSMB1Protocol, EnableSMB2Protocol, RejectUnencryptedAccess, 
+          RequireSecuritySignature, EncryptData 
+    } catch {
+      Add-ErrorEntry -Function "Get-SecurityPosture" -Error "Failed to get SMB config: $_"
+    }
+  } else {
+    $smb1 = Get-RegistryValueSafe "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" "SMB1"
+  }
+
+  # BitLocker status
+  $bitlocker = @()
+  if (Test-Command "Get-BitLockerVolume") {
+    try { 
+      $bitlocker = Get-BitLockerVolume -ErrorAction Stop | 
+        Select-Object MountPoint, VolumeStatus, ProtectionStatus, EncryptionPercentage, KeyProtector 
+    } catch {
+      Add-ErrorEntry -Function "Get-SecurityPosture" -Error "Failed to get BitLocker status: $_"
+    }
+  } else {
+    $mb = (Invoke-ExeCapture -File "manage-bde.exe" -Args @("-status")).StdOut
+    if ($mb) { 
+      $bitlocker = @([pscustomobject]@{ 
+        Note="manage-bde -status"
+        Raw=$mb 
+      }) 
+    }
+  }
+
+  return [pscustomobject]@{
+    DefenderStatus = $def
+    SecurityCenterAV = $av
+    UAC = $uac
+    RDP_DenyTSConnections = $rdpDeny
+    SMB_ServerConfiguration = $smbSrv
+    SMB1_RegistryFallback = $smb1
+    BitLocker = $bitlocker
+  }
+}
+
+function Get-SharesInfo {
+  $shares = @()
+  if (Test-Command "Get-SmbShare") {
+    try { 
+      $shares = Get-SmbShare -ErrorAction Stop | 
+        Select-Object Name, Path, Description, ScopeName, EncryptData, 
+          FolderEnumerationMode, CachingMode 
+    } catch {
+      Add-ErrorEntry -Function "Get-SharesInfo" -Error "Failed to get SMB shares: $_"
+    }
+  } else {
+    $raw = (Invoke-ExeCapture -File "net" -Args @("share")).StdOut
+    $shares = @([pscustomobject]@{ 
+      Note="net share raw"
+      Raw=$raw 
+    })
+  }
+  return $shares
+}
+
+function Get-CertificatesLocalMachine {
+  $certs = @()
+  try {
+    $stores = @("My","Root","CA","AuthRoot","TrustedPublisher","TrustedPeople")
+    foreach ($s in $stores) {
+      $path = "Cert:\LocalMachine\$s"
+      if (Test-Path $path) {
+        $storeCerts = Get-ChildItem $path -ErrorAction Stop
+        foreach ($cert in $storeCerts) {
+          $certs += [pscustomobject]@{
+            Store = $s
+            Subject = $cert.Subject
+            Issuer = $cert.Issuer
+            Thumbprint = $cert.Thumbprint
+            NotBefore = $cert.NotBefore
+            NotAfter = $cert.NotAfter
+            HasPrivateKey = $cert.HasPrivateKey
+            SerialNumber = $cert.SerialNumber
+          }
+        }
+      }
+    }
+  } catch {
+    Add-ErrorEntry -Function "Get-CertificatesLocalMachine" -Error "Failed to get certificates: $_"
+  }
+  return $certs
+}
+
+function Get-CriticalFileHashes {
+  $criticalFiles = @(
+    "$env:SystemRoot\System32\drivers\etc\hosts",
+    "$env:SystemRoot\System32\drivers\etc\networks",
+    "$env:SystemRoot\System32\drivers\etc\protocol",
+    "$env:SystemRoot\System32\drivers\etc\services"
+  )
+  
+  $hashes = @()
+  foreach ($file in $criticalFiles) {
+    if (Test-Path $file) {
+      try {
+        $item = Get-Item $file -ErrorAction Stop
+        $hashes += [pscustomobject]@{
+          File = $file
+          SHA256 = (Get-FileHashSafe $file)
+          LastModified = $item.LastWriteTime
+          Size = $item.Length
+        }
+      } catch {}
+    }
+  }
+  
+  return $hashes
+}
+
+function Get-EventLogSummary24h {
+  $since = (Get-Date).AddHours(-24)
+
+  $summaries = @()
+  foreach ($log in @("System","Security")) {
+    try {
+      $events = Get-WinEvent -FilterHashtable @{ 
+        LogName=$log
+        StartTime=$since 
+      } -ErrorAction Stop
+      
+      $summaries += [pscustomobject]@{
+        LogName = $log
+        Since  = $since
+        Total  = $events.Count
+        Critical = ($events | Where-Object LevelDisplayName -eq "Critical").Count
+        Error    = ($events | Where-Object LevelDisplayName -eq "Error").Count
+        Warning  = ($events | Where-Object LevelDisplayName -eq "Warning").Count
+        TopEventIDs = (($events | Group-Object Id | Sort-Object Count -Descending | 
+          Select-Object -First 10 | ForEach-Object { 
+            "$($_.Name):$($_.Count)" 
+          }) -join ", ")
+      }
+    } catch {
+      $summaries += [pscustomobject]@{ 
+        LogName=$log
+        Since=$since
+        Note="Unable to read log (need admin rights or log unavailable)"
+        Error=$_.Exception.Message 
+      }
+    }
+  }
+  return $summaries
+}
+
+# ---------------------------- Main Execution ----------------------------
+
+Write-Host ""
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "  Windows Inventory Collection v2.0" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+
+# Memory optimization
+[System.GC]::Collect()
+[System.GC]::WaitForPendingFinalizers()
+
+$reportDir = New-ReportFolder -Root $OutputRoot
+$csvDir    = Join-Path $reportDir "csv"
+$artDir    = Join-Path $reportDir "artifacts"
+
+Write-LogEntry "Starting inventory collection" -Level "INFO"
+Write-LogEntry "Output directory: $reportDir"
+Write-LogEntry "Running as Administrator: $(Is-Admin)"
+
+$inventory = [ordered]@{
+  Metadata = [ordered]@{
+    ScriptName       = "Get-WindowsInventory.ps1"
+    Version          = "2.0"
+    QuickMode        = [bool]$Quick
+    IncludeEventLogs = [bool]$IncludeEventLogs
+    CollectedAt      = (Get-Date).ToString("o")
+    OutputDir        = $reportDir
+    IsAdmin          = (Is-Admin)
+    ExecutionTime    = [ordered]@{
+      Start = $script:StartTime
+      End = $null
+      DurationSeconds = $null
+    }
+  }
+  System     = $null
+  Storage    = $null
+  Network    = $null
+  DNSCache   = [ordered]@{ Csv = $null; Count = 0 }
+  Ports      = $null
+  EstablishedConnections = [ordered]@{ Csv = $null; Count = 0 }
+  Services   = [ordered]@{ Csv = $null; Count = 0 }
+  Processes  = [ordered]@{ Csv = $null; Count = 0 }
+  Users      = [ordered]@{ UsersCsv = $null; GroupsCsv = $null; MembersCsv = $null }
+  Tasks      = [ordered]@{ Csv = $null; Count = 0 }
+  Autoruns   = [ordered]@{ Csv = $null; Count = 0 }
+  Persistence= $null
+  Software   = [ordered]@{ UninstallCsv = $null; AppxCsv = $null; Count = 0 }
+  Patches    = [ordered]@{ Csv = $null; Count = 0 }
+  Firewall   = [ordered]@{ ProfilesCsv = $null; RulesCsv = $null; NetshText = $null }
+  Shares     = [ordered]@{ Csv = $null; Count = 0 }
+  Certs      = [ordered]@{ Csv = $null; Count = 0 }
+  Security   = $null
+  CriticalFiles = [ordered]@{ Csv = $null; Count = 0 }
+  Artifacts  = [ordered]@{}
+  FileHashes = [ordered]@{}
+}
+
+# Step 1: System Summary
+Update-Progress "Collecting system summary..."
+Write-LogEntry "Collecting system summary"
+$inventory.System = Get-SystemSummary
+
+# Step 2: Storage
+Update-Progress "Collecting storage information..."
+Write-LogEntry "Collecting storage"
+$inventory.Storage = Get-StorageInfo
+
+# Step 3: Network
+Update-Progress "Collecting network configuration..."
+Write-LogEntry "Collecting network"
+$net = Get-NetworkInfo
+$inventory.Network = [pscustomobject]@{
+  NetIPConfigurationAvailable = $net.NetIPConfigurationAvailable
+  IPEnabledAdapterCount       = ($net.IPEnabledAdapters | Measure-Object).Count
+  DnsEntryCount               = ($net.DnsClientServers | Measure-Object).Count
+}
+
+$routePath = Join-Path $artDir "route_print.txt"
+$arpPath   = Join-Path $artDir "arp_a.txt"
+Write-TextFile -Path $routePath -Content $net.RoutesText
+Write-TextFile -Path $arpPath   -Content $net.ArpText
+$inventory.Artifacts.Routes = $routePath
+$inventory.Artifacts.Arp    = $arpPath
+
+$ipJsonPath = Join-Path $artDir "network_ipenabled_adapters.json"
+try { 
+  ($net.IPEnabledAdapters | ConvertTo-Json -Depth 6) | 
+    Out-File $ipJsonPath -Encoding UTF8 -Force 
+} catch {}
+$inventory.Artifacts.IPEnabledAdapters = $ipJsonPath
+
+$dnsJsonPath = Join-Path $artDir "network_dns_servers.json"
+try { 
+  ($net.DnsClientServers | ConvertTo-Json -Depth 6) | 
+    Out-File $dnsJsonPath -Encoding UTF8 -Force 
+} catch {}
+$inventory.Artifacts.DnsServers = $dnsJsonPath
+
+# Step 4: DNS Cache
+Update-Progress "Collecting DNS cache..."
+Write-LogEntry "Collecting DNS cache"
+$dnsCache = Get-DNSCache
+$dnsCacheCsv = Join-Path $csvDir "dns_cache.csv"
+Export-CsvSafe -Data $dnsCache -Path $dnsCacheCsv
+$inventory.DNSCache.Csv = $dnsCacheCsv
+$inventory.DNSCache.Count = ($dnsCache | Measure-Object).Count
+
+# Step 5: Ports and Netstat
+Update-Progress "Collecting open ports and network connections..."
+Write-LogEntry "Collecting ports/netstat"
+$ports = Get-OpenPortsAndNetstat
+$inventory.Ports = [pscustomobject]@{
+  TcpCount = ($ports.TcpConnections | Measure-Object).Count
+  UdpCount = ($ports.UdpEndpoints   | Measure-Object).Count
+}
+
+$netstatPath = Join-Path $artDir "netstat_ano.txt"
+Write-TextFile -Path $netstatPath -Content $ports.NetstatText
+$inventory.Artifacts.Netstat = $netstatPath
+
+if ($ports.TcpConnections.Count -gt 0) {
+  $tcpCsv = Join-Path $csvDir "tcp_connections.csv"
+  Export-CsvSafe -Data $ports.TcpConnections -Path $tcpCsv
+  $inventory.Artifacts.TcpConnectionsCsv = $tcpCsv
+}
+
+if ($ports.UdpEndpoints.Count -gt 0) {
+  $udpCsv = Join-Path $csvDir "udp_endpoints.csv"
+  Export-CsvSafe -Data $ports.UdpEndpoints -Path $udpCsv
+  $inventory.Artifacts.UdpEndpointsCsv = $udpCsv
+}
+
+# Step 6: Enhanced Network Connections
+Update-Progress "Mapping established connections to processes..."
+Write-LogEntry "Collecting enhanced network connections"
+$enhancedConns = Get-NetworkConnectionsEnhanced
+if ($enhancedConns.Count -gt 0) {
+  $connCsv = Join-Path $csvDir "established_connections_with_processes.csv"
+  Export-CsvSafe -Data $enhancedConns -Path $connCsv
+  $inventory.EstablishedConnections.Csv = $connCsv
+  $inventory.EstablishedConnections.Count = ($enhancedConns | Measure-Object).Count
+}
+
+# Step 7: Services and Processes
+Update-Progress "Collecting services and processes..."
+Write-LogEntry "Collecting services/processes"
+$sp = Get-ServicesAndProcesses
+$svcCsv = Join-Path $csvDir "services.csv"
+$procCsv = Join-Path $csvDir "processes.csv"
+Export-CsvSafe -Data $sp.Services  -Path $svcCsv
+Export-CsvSafe -Data $sp.Processes -Path $procCsv
+$inventory.Services.Csv = $svcCsv
+$inventory.Services.Count = ($sp.Services | Measure-Object).Count
+$inventory.Processes.Csv = $procCsv
+$inventory.Processes.Count = ($sp.Processes | Measure-Object).Count
+
+# Step 8: Local Users and Groups
+Update-Progress "Collecting local users and groups..."
+Write-LogEntry "Collecting local users/groups"
+$ug = Get-LocalUsersAndGroups
+$usersCsv   = Join-Path $csvDir "local_users.csv"
+$groupsCsv  = Join-Path $csvDir "local_groups.csv"
+$membersCsv = Join-Path $csvDir "local_group_members.csv"
+Export-CsvSafe -Data $ug.Users        -Path $usersCsv
+Export-CsvSafe -Data $ug.Groups       -Path $groupsCsv
+Export-CsvSafe -Data $ug.GroupMembers -Path $membersCsv
+$inventory.Users.UsersCsv   = $usersCsv
+$inventory.Users.GroupsCsv  = $groupsCsv
+$inventory.Users.MembersCsv = $membersCsv
+
+# Step 9: Scheduled Tasks
+Update-Progress "Collecting scheduled tasks..."
+Write-LogEntry "Collecting scheduled tasks"
+$tasks = Get-ScheduledTasksInfo
+$tasksCsv = Join-Path $csvDir "scheduled_tasks.csv"
+Export-CsvSafe -Data $tasks -Path $tasksCsv
+$inventory.Tasks.Csv = $tasksCsv
+$inventory.Tasks.Count = ($tasks | Measure-Object).Count
+
+# Step 10: Autoruns
+Update-Progress "Collecting autorun locations..."
+Write-LogEntry "Collecting autoruns"
+$autoruns = Get-AutorunsInfo
+$autorunsCsv = Join-Path $csvDir "autoruns.csv"
+Export-CsvSafe -Data $autoruns -Path $autorunsCsv
+$inventory.Autoruns.Csv = $autorunsCsv
+$inventory.Autoruns.Count = ($autoruns | Measure-Object).Count
+
+# Step 11: Persistence Locations
+Update-Progress "Checking persistence mechanisms..."
+Write-LogEntry "Collecting persistence locations"
+$inventory.Persistence = Get-PersistenceLocations
+$wmiCsv = Join-Path $csvDir "wmi_event_filters.csv"
+$suspSvcCsv = Join-Path $csvDir "suspicious_services.csv"
+Export-CsvSafe -Data $inventory.Persistence.WMIEventFilters -Path $wmiCsv
+Export-CsvSafe -Data $inventory.Persistence.SuspiciousServices -Path $suspSvcCsv
+$inventory.Artifacts.WMIEventFiltersCsv = $wmiCsv
+$inventory.Artifacts.SuspiciousServicesCsv = $suspSvcCsv
+
+# Step 12: Security Posture
+Update-Progress "Collecting security posture..."
+Write-LogEntry "Collecting security posture"
+$inventory.Security = Get-SecurityPosture
+
+# Step 13: Patches
+Update-Progress "Collecting installed patches..."
+Write-LogEntry "Collecting patches"
+$patches = Get-PatchInfo
+$patchCsv = Join-Path $csvDir "patches_hotfix.csv"
+Export-CsvSafe -Data $patches -Path $patchCsv
+$inventory.Patches.Csv = $patchCsv
+$inventory.Patches.Count = ($patches | Measure-Object).Count
+
+# Step 14: Software
+if ($Software -and -not $Quick) {
+  Update-Progress "Collecting installed software (full)..."
+  Write-LogEntry "Collecting installed software (full)"
+  $soft = Get-InstalledSoftware
+  $swCsv = Join-Path $csvDir "installed_software_registry.csv"
+  Export-CsvSafe -Data $soft.UninstallRegistry -Path $swCsv
+  $inventory.Software.UninstallCsv = $swCsv
+  $inventory.Software.Count = ($soft.UninstallRegistry | Measure-Object).Count
+
+  if ($soft.AppxPackages.Count -gt 0) {
+    $appxCsv = Join-Path $csvDir "installed_software_appx.csv"
+    Export-CsvSafe -Data $soft.AppxPackages -Path $appxCsv
+    $inventory.Software.AppxCsv = $appxCsv
+  }
+} elseif ($Software -and $Quick) {
+  Update-Progress "Collecting installed software (quick)..."
+  Write-LogEntry "Collecting installed software (quick: registry only)"
+  $soft = Get-InstalledSoftware
+  $swCsv = Join-Path $csvDir "installed_software_registry.csv"
+  Export-CsvSafe -Data $soft.UninstallRegistry -Path $swCsv
+  $inventory.Software.UninstallCsv = $swCsv
+  $inventory.Software.Count = ($soft.UninstallRegistry | Measure-Object).Count
+}
+
+# Step 15: Firewall
+if ($Firewall -and -not $Quick) {
+  Update-Progress "Collecting firewall configuration (full)..."
+  Write-LogEntry "Collecting firewall profiles/rules (full)"
+  $fw = Get-FirewallInfo
+  
+  if ($fw.Profiles.Count -gt 0) {
+    $fwProfCsv = Join-Path $csvDir "firewall_profiles.csv"
+    Export-CsvSafe -Data $fw.Profiles -Path $fwProfCsv
+    $inventory.Firewall.ProfilesCsv = $fwProfCsv
+  }
+  
+  if ($fw.Rules.Count -gt 0) {
+    $fwRulesCsv = Join-Path $csvDir "firewall_rules.csv"
+    Export-CsvSafe -Data $fw.Rules -Path $fwRulesCsv
+    $inventory.Firewall.RulesCsv = $fwRulesCsv
+  }
+  
+  if ($fw.NetshRawText) {
+    $fwTxt = Join-Path $artDir "firewall_netsh_rules.txt"
+    Write-TextFile -Path $fwTxt -Content $fw.NetshRawText
+    $inventory.Firewall.NetshText = $fwTxt
+  }
+} elseif ($Firewall -and $Quick) {
+  Update-Progress "Collecting firewall profiles (quick)..."
+  Write-LogEntry "Collecting firewall profiles (quick)"
+  $fw = Get-FirewallInfo
+  
+  if ($fw.Profiles.Count -gt 0) {
+    $fwProfCsv = Join-Path $csvDir "firewall_profiles.csv"
+    Export-CsvSafe -Data $fw.Profiles -Path $fwProfCsv
+    $inventory.Firewall.ProfilesCsv = $fwProfCsv
+  }
+}
+
+# Step 16: Shares
+Update-Progress "Collecting network shares..."
+Write-LogEntry "Collecting shares"
+$shares = Get-SharesInfo
+$sharesCsv = Join-Path $csvDir "shares.csv"
+Export-CsvSafe -Data $shares -Path $sharesCsv
+$inventory.Shares.Csv = $sharesCsv
+$inventory.Shares.Count = ($shares | Measure-Object).Count
+
+# Step 17: Certificates
+if ($Certs -and -not $Quick) {
+  Update-Progress "Collecting LocalMachine certificates..."
+  Write-LogEntry "Collecting LocalMachine certificates"
+  $certList = Get-CertificatesLocalMachine
+  $certCsv = Join-Path $csvDir "certificates_localmachine.csv"
+  Export-CsvSafe -Data $certList -Path $certCsv
+  $inventory.Certs.Csv = $certCsv
+  $inventory.Certs.Count = ($certList | Measure-Object).Count
+}
+
+# Step 18: Critical File Hashes
+Update-Progress "Hashing critical system files..."
+Write-LogEntry "Collecting critical file hashes"
+$criticalHashes = Get-CriticalFileHashes
+$critHashCsv = Join-Path $csvDir "critical_file_hashes.csv"
+Export-CsvSafe -Data $criticalHashes -Path $critHashCsv
+$inventory.CriticalFiles.Csv = $critHashCsv
+$inventory.CriticalFiles.Count = ($criticalHashes | Measure-Object).Count
+
+# Step 19: Event Logs (Optional)
+if ($IncludeEventLogs) {
+  Update-Progress "Collecting event log summary..."
+  Write-LogEntry "Collecting event log summary (last 24h)"
+  $ev = Get-EventLogSummary24h
+  $evCsv = Join-Path $csvDir "eventlog_summary_24h.csv"
+  Export-CsvSafe -Data $ev -Path $evCsv
+  $inventory.Artifacts.EventLogSummary24h = $evCsv
+}
+
+# Step 20: Additional Baseline Artifacts
+Update-Progress "Collecting baseline text artifacts..."
+Write-LogEntry "Collecting baseline text artifacts"
+$sysinfoPath = Join-Path $artDir "systeminfo.txt"
+$ipconfigPath = Join-Path $artDir "ipconfig_all.txt"
+Write-TextFile -Path $sysinfoPath -Content (Invoke-ExeCapture -File "systeminfo.exe").StdOut
+Write-TextFile -Path $ipconfigPath -Content (Invoke-ExeCapture -File "ipconfig.exe" -Args @("/all")).StdOut
+$inventory.Artifacts.SystemInfo = $sysinfoPath
+$inventory.Artifacts.IpconfigAll = $ipconfigPath
+
+# Hash key output files
+$inventory.FileHashes.Hosts = [pscustomobject]@{ 
+  Path = "$env:SystemRoot\System32\drivers\etc\hosts"
+  Sha256 = (Get-FileHashSafe "$env:SystemRoot\System32\drivers\etc\hosts") 
+}
+
+# Memory cleanup
+[System.GC]::Collect()
+
+# Finalize timing
+$script:EndTime = Get-Date
+$inventory.Metadata.ExecutionTime.End = $script:EndTime
+$inventory.Metadata.ExecutionTime.DurationSeconds = 
+  [math]::Round(($script:EndTime - $script:StartTime).TotalSeconds, 2)
+$inventory.Metadata.ErrorCount = $script:ErrorLog.Count
+
+# Save errors if any
+if ($script:ErrorLog.Count -gt 0) {
+  $errorCsv = Join-Path $csvDir "collection_errors.csv"
+  Export-CsvSafe -Data $script:ErrorLog -Path $errorCsv
+  $inventory.Artifacts.ErrorLog = $errorCsv
+  Write-LogEntry "Encountered $($script:ErrorLog.Count) errors during collection" -Level "WARN"
+}
+
+# Write JSON report
+Write-LogEntry "Writing JSON summary"
+$jsonPath = Join-Path $reportDir "inventory.json"
+try {
+  ($inventory | ConvertTo-Json -Depth 10) | Out-File -FilePath $jsonPath -Encoding UTF8 -Force
+} catch {
+  Write-LogEntry "Failed to write JSON: $_" -Level "ERROR"
+}
+
+# Create enhanced HTML report
+Write-LogEntry "Writing HTML report"
+$htmlPath = Join-Path $reportDir "system_report.html"
+
+$sys = $inventory.System
+$sec = $inventory.Security
+
+$htmlStyle = @"
+<style>
+  body { 
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+    margin: 20px; 
+    background-color: #f5f5f5; 
+  }
+  .header { 
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+    color: white; 
+    padding: 30px; 
+    border-radius: 10px; 
+    margin-bottom: 20px; 
+  }
+  .header h1 { margin: 0; font-size: 2em; }
+  .header p { margin: 5px 0; opacity: 0.9; }
+  .section { 
+    background: white; 
+    padding: 20px; 
+    margin-bottom: 20px; 
+    border-radius: 10px; 
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1); 
+  }
+  .section h2 { 
+    color: #667eea; 
+    border-bottom: 2px solid #667eea; 
+    padding-bottom: 10px; 
+    margin-top: 0; 
+  }
+  table { 
+    border-collapse: collapse; 
+    width: 100%; 
+    margin-bottom: 20px; 
+  }
+  th { 
+    background-color: #667eea; 
+    color: white; 
+    padding: 12px; 
+    text-align: left; 
+    font-weight: 600; 
+  }
+  td { 
+    padding: 10px; 
+    border-bottom: 1px solid #e0e0e0; 
+  }
+  tr:hover { background-color: #f8f9fa; }
+  .metric { 
+    display: inline-block; 
+    background: #f8f9fa; 
+    padding: 15px 20px; 
+    margin: 10px 10px 10px 0; 
+    border-radius: 8px; 
+    border-left: 4px solid #667eea; 
+  }
+  .metric-label { 
+    font-size: 0.85em; 
+    color: #666; 
+    text-transform: uppercase; 
+  }
+  .metric-value { 
+    font-size: 1.5em; 
+    font-weight: bold; 
+    color: #333; 
+  }
+  .warning { background-color: #fff3cd; border-left-color: #ffc107; }
+  .danger { background-color: #f8d7da; border-left-color: #dc3545; }
+  .success { background-color: #d4edda; border-left-color: #28a745; }
+  .info { background-color: #d1ecf1; border-left-color: #17a2b8; }
+  a { color: #667eea; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .footer { 
+    text-align: center; 
+    padding: 20px; 
+    color: #666; 
+    font-size: 0.9em; 
+  }
+</style>
+"@
+
+$summaryMetrics = @"
+<div class="metric $(if ($sys.IsAdmin) { 'success' } else { 'warning' })">
+  <div class="metric-label">Admin Rights</div>
+  <div class="metric-value">$(if ($sys.IsAdmin) { 'YES' } else { 'NO' })</div>
+</div>
+<div class="metric">
+  <div class="metric-label">Services</div>
+  <div class="metric-value">$($inventory.Services.Count)</div>
+</div>
+<div class="metric">
+  <div class="metric-label">Processes</div>
+  <div class="metric-value">$($inventory.Processes.Count)</div>
+</div>
+<div class="metric">
+  <div class="metric-label">Scheduled Tasks</div>
+  <div class="metric-value">$($inventory.Tasks.Count)</div>
+</div>
+<div class="metric">
+  <div class="metric-label">Autoruns</div>
+  <div class="metric-value">$($inventory.Autoruns.Count)</div>
+</div>
+<div class="metric">
+  <div class="metric-label">Software</div>
+  <div class="metric-value">$($inventory.Software.Count)</div>
+</div>
+<div class="metric">
+  <div class="metric-label">Patches</div>
+  <div class="metric-value">$($inventory.Patches.Count)</div>
+</div>
+<div class="metric">
+  <div class="metric-label">Established Connections</div>
+  <div class="metric-value">$($inventory.EstablishedConnections.Count)</div>
+</div>
+"@
+
+$summaryTable = @(
+  [pscustomobject]@{ Category="System"; Key="Computer Name"; Value=$sys.ComputerName },
+  [pscustomobject]@{ Category="System"; Key="Domain"; Value=$sys.Domain },
+  [pscustomobject]@{ Category="System"; Key="Part of Domain"; Value=$sys.PartOfDomain },
+  [pscustomobject]@{ Category="System"; Key="Operating System"; Value=("$($sys.OSName) ($($sys.OSArchitecture))") },
+  [pscustomobject]@{ Category="System"; Key="OS Version/Build"; Value=("$($sys.OSVersion) / $($sys.OSBuildNumber)") },
+  [pscustomobject]@{ Category="System"; Key="Last Boot"; Value=$sys.LastBootUpTime },
+  [pscustomobject]@{ Category="System"; Key="Uptime (Hours)"; Value=$sys.UptimeHours },
+  [pscustomobject]@{ Category="Hardware"; Key="Manufacturer/Model"; Value=("$($sys.Manufacturer) / $($sys.Model)") },
+  [pscustomobject]@{ Category="Hardware"; Key="CPU"; Value=$sys.CPUName },
+  [pscustomobject]@{ Category="Hardware"; Key="CPU Cores"; Value=$sys.CPUCores },
+  [pscustomobject]@{ Category="Hardware"; Key="RAM (GB)"; Value=$sys.TotalMemoryGB },
+  [pscustomobject]@{ Category="Security"; Key="UAC Enabled"; Value=$sec.UAC.EnableLUA },
+  [pscustomobject]@{ Category="Security"; Key="RDP Denied"; Value=$sec.RDP_DenyTSConnections },
+  [pscustomobject]@{ Category="Network"; Key="TCP Connections"; Value=$inventory.Ports.TcpCount },
+  [pscustomobject]@{ Category="Network"; Key="UDP Endpoints"; Value=$inventory.Ports.UdpCount },
+  [pscustomobject]@{ Category="Inventory"; Key="Network Shares"; Value=$inventory.Shares.Count },
+  [pscustomobject]@{ Category="Inventory"; Key="Certificates"; Value=$inventory.Certs.Count }
+)
+
+$summaryHtml = $summaryTable | ConvertTo-Html -Property Category, Key, Value -Fragment
+
+$artifactLinks = "<ul>"
+foreach ($k in $inventory.Artifacts.Keys) {
+  $v = $inventory.Artifacts[$k]
+  $relPath = $v.Replace($reportDir + "\", "")
+  $artifactLinks += "<li><b>$k</b>: <a href='$relPath'>$relPath</a></li>"
+}
+$artifactLinks += "</ul>"
+
+$errorSection = ""
+if ($inventory.Metadata.ErrorCount -gt 0) {
+  $errorSection = @"
+<div class="section danger">
+  <h2>⚠ Collection Errors ($($inventory.Metadata.ErrorCount))</h2>
+  <p>Some data collection operations encountered errors. See <a href="csv/collection_errors.csv">collection_errors.csv</a> for details.</p>
+</div>
+"@
+}
+
+$htmlContent = @"
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Windows Inventory Report - $($sys.ComputerName)</title>
+  $htmlStyle
+</head>
+<body>
+  <div class="header">
+    <h1>🖥 Windows Inventory Report</h1>
+    <p><b>Computer:</b> $($sys.ComputerName) | <b>Collected:</b> $($inventory.Metadata.CollectedAt)</p>
+    <p><b>Duration:</b> $($inventory.Metadata.ExecutionTime.DurationSeconds)s | <b>Quick Mode:</b> $($inventory.Metadata.QuickMode)</p>
+  </div>
+
+  $errorSection
+
+  <div class="section">
+    <h2>📊 Summary Metrics</h2>
+    $summaryMetrics
+  </div>
+
+  <div class="section">
+    <h2>📋 System Details</h2>
+    $summaryHtml
+  </div>
+
+  <div class="section">
+    <h2>📁 Artifacts & Reports</h2>
+    <p><b>JSON Summary:</b> <a href="inventory.json">inventory.json</a></p>
+    <p><b>Collection Log:</b> <a href="collection.log">collection.log</a></p>
+    $artifactLinks
+  </div>
+
+  <div class="footer">
+    <p>Generated by Get-WindowsInventory.ps1 v2.0</p>
+    <p>Report Directory: $reportDir</p>
+  </div>
+</body>
+</html>
+"@
+
+try {
+  $htmlContent | Out-File -FilePath $htmlPath -Encoding UTF8 -Force
+} catch {
+  Write-LogEntry "Failed to write HTML report: $_" -Level "ERROR"
+}
+
+# Final file hashes
+$inventory.FileHashes.InventoryJson = [pscustomobject]@{ 
+  Path = $jsonPath
+  Sha256 = (Get-FileHashSafe $jsonPath) 
+}
+$inventory.FileHashes.HtmlReport = [pscustomobject]@{ 
+  Path = $htmlPath
+  Sha256 = (Get-FileHashSafe $htmlPath) 
+}
+
+# Overwrite JSON with final hashes
+try {
+  ($inventory | ConvertTo-Json -Depth 10) | Out-File -FilePath $jsonPath -Encoding UTF8 -Force
+} catch {}
+
+# Compression (optional)
+$zipPath = $null
+if ($Compress) {
+  $zipPath = Compress-ReportFolder -FolderPath $reportDir
+}
+
+# Complete progress
+Write-ProgressSafe -Activity "Windows Inventory Collection" -Status "Complete" -PercentComplete 100
+Write-Progress -Activity "Windows Inventory Collection" -Completed
+
+# Final summary
+Write-Host ""
+Write-Host "========================================" -ForegroundColor Green
+Write-Host "  Collection Complete!" -ForegroundColor Green
+Write-Host "========================================" -ForegroundColor Green
+Write-Host ""
+Write-LogEntry "Collection complete" -Level "SUCCESS"
+Write-LogEntry "Report folder: $reportDir"
+Write-LogEntry "JSON summary: $jsonPath"
+Write-LogEntry "HTML report: $htmlPath"
+
+if ($zipPath) {
+  Write-LogEntry "Compressed archive: $zipPath"
+}
+
+Write-Host "Report folder:  " -NoNewline
+Write-Host $reportDir -ForegroundColor Cyan
+Write-Host "JSON summary:   " -NoNewline
+Write-Host $jsonPath -ForegroundColor Cyan
+Write-Host "HTML report:    " -NoNewline
+Write-Host $htmlPath -ForegroundColor Cyan
+
+if ($zipPath) {
+  Write-Host "ZIP archive:    " -NoNewline
+  Write-Host $zipPath -ForegroundColor Cyan
+}
+
+Write-Host ""
+Write-Host "Execution time: $($inventory.Metadata.ExecutionTime.DurationSeconds)s" -ForegroundColor Yellow
+
+if ($inventory.Metadata.ErrorCount -gt 0) {
+  Write-Host "Errors encountered: $($inventory.Metadata.ErrorCount) (see collection.log)" -ForegroundColor Red
+}
+
+Write-Host ""
