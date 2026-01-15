@@ -2994,7 +2994,7 @@ if ($inventory.Metadata.ErrorCount -gt 0) {
 }
 
 # Build JavaScript for interactive features
-$javaScript = @"
+$javaScript = @'
 <script>
 // Tab Management
 function switchTab(tabName) {
@@ -3017,7 +3017,7 @@ function parseCSV(text) {
   const lines = text.split('\n').filter(line => line.trim());
   if (lines.length === 0) return [];
 
-  const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$('$/g, ''));
+  const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
   const rows = [];
 
   for (let i = 1; i < lines.length; i++) {
@@ -3029,13 +3029,13 @@ function parseCSV(text) {
       if (char === '"') {
         inQuotes = !inQuotes;
       } else if (char === ',' && !inQuotes) {
-        values.push(current.trim().replace(/^"|"$('$/g, ''));
+        values.push(current.trim().replace(/^"|"$/g, ''));
         current = '';
       } else {
         current += char;
       }
     }
-    values.push(current.trim().replace(/^"|"$('$/g, ''));
+    values.push(current.trim().replace(/^"|"$/g, ''));
 
     if (values.length === headers.length) {
       const obj = {};
@@ -3281,7 +3281,7 @@ document.addEventListener('DOMContentLoaded', function() {
   switchTab('dashboard');
 });
 </script>
-"@
+'@
 
 $htmlContent = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Windows Inventory Report - $($sys.ComputerName)</title>$htmlStyle$javaScript</head><body>"
 $htmlContent += "<div class='header'><h1>Windows Inventory Report - CCDC Edition</h1>"
@@ -3290,10 +3290,10 @@ $htmlContent += "<p><b>Duration:</b> $($inventory.Metadata.ExecutionTime.Duratio
 
 # Tab Navigation
 $htmlContent += "<nav class='tab-nav'><ul>"
-$htmlContent += "<li><button onclick='switchTab(\"dashboard\")' class='active'>Dashboard</button></li>"
-$htmlContent += "<li><button onclick='switchTab(\"baseline-comparison\")'>Baseline Comparison</button></li>"
-$htmlContent += "<li><button onclick='switchTab(\"data-explorer\")'>Data Explorer</button></li>"
-$htmlContent += "<li><button onclick='switchTab(\"report-comparison\")'>Report Comparison</button></li>"
+$htmlContent += "<li><button onclick=""switchTab('dashboard')"" class='active'>Dashboard</button></li>"
+$htmlContent += "<li><button onclick=""switchTab('baseline-comparison')"">Baseline Comparison</button></li>"
+$htmlContent += "<li><button onclick=""switchTab('data-explorer')"">Data Explorer</button></li>"
+$htmlContent += "<li><button onclick=""switchTab('report-comparison')"">Report Comparison</button></li>"
 $htmlContent += "</ul></nav>"
 
 # Tab 1: Dashboard
