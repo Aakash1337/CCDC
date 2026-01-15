@@ -1913,40 +1913,16 @@ if ($totalThreats -gt 0 -or $criticalWeaknesses -gt 0) {
   $threatSummary = "<div class='section $threatClass'><h2>[!] CCDC THREAT ANALYSIS - IMMEDIATE ATTENTION REQUIRED</h2><div style='font-size: 1.2em; margin: 15px 0;'><strong>Total Suspicious Items: $totalThreats</strong> | <strong>Critical Security Issues: $criticalWeaknesses</strong></div><div style='display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-top: 20px;'>$threatMetrics</div><div style='margin-top: 20px; padding: 15px; background: rgba(255,255,255,0.3); border-radius: 5px;'><strong>Next Steps:</strong><ol style='margin: 10px 0;'><li>Review all suspicious items in the CSV files linked above</li><li>Investigate processes, services, and tasks running from unusual locations</li><li>Verify all network connections, especially to uncommon ports</li><li>Check unauthorized administrators and remove if needed</li><li>Address critical security weaknesses immediately (Defender, Firewall, UAC)</li><li>Review recent system file modifications for unauthorized changes</li></ol></div></div>"
 }
 
-$summaryMetrics = @"
-<div class="metric $(if ($sys.IsAdmin) { 'success' } else { 'warning' })">
-  <div class="metric-label">Admin Rights</div>
-  <div class="metric-value">$(if ($sys.IsAdmin) { 'YES' } else { 'NO' })</div>
-</div>
-<div class="metric">
-  <div class="metric-label">Services</div>
-  <div class="metric-value">$($inventory.Services.Count)</div>
-</div>
-<div class="metric">
-  <div class="metric-label">Processes</div>
-  <div class="metric-value">$($inventory.Processes.Count)</div>
-</div>
-<div class="metric">
-  <div class="metric-label">Scheduled Tasks</div>
-  <div class="metric-value">$($inventory.Tasks.Count)</div>
-</div>
-<div class="metric">
-  <div class="metric-label">Autoruns</div>
-  <div class="metric-value">$($inventory.Autoruns.Count)</div>
-</div>
-<div class="metric">
-  <div class="metric-label">Software</div>
-  <div class="metric-value">$($inventory.Software.Count)</div>
-</div>
-<div class="metric">
-  <div class="metric-label">Patches</div>
-  <div class="metric-value">$($inventory.Patches.Count)</div>
-</div>
-<div class="metric">
-  <div class="metric-label">Established Connections</div>
-  <div class="metric-value">$($inventory.EstablishedConnections.Count)</div>
-</div>
-"@
+$adminClass = if ($sys.IsAdmin) { 'success' } else { 'warning' }
+$adminText = if ($sys.IsAdmin) { 'YES' } else { 'NO' }
+$summaryMetrics = "<div class='metric $adminClass'><div class='metric-label'>Admin Rights</div><div class='metric-value'>$adminText</div></div>"
+$summaryMetrics += "<div class='metric'><div class='metric-label'>Services</div><div class='metric-value'>$($inventory.Services.Count)</div></div>"
+$summaryMetrics += "<div class='metric'><div class='metric-label'>Processes</div><div class='metric-value'>$($inventory.Processes.Count)</div></div>"
+$summaryMetrics += "<div class='metric'><div class='metric-label'>Scheduled Tasks</div><div class='metric-value'>$($inventory.Tasks.Count)</div></div>"
+$summaryMetrics += "<div class='metric'><div class='metric-label'>Autoruns</div><div class='metric-value'>$($inventory.Autoruns.Count)</div></div>"
+$summaryMetrics += "<div class='metric'><div class='metric-label'>Software</div><div class='metric-value'>$($inventory.Software.Count)</div></div>"
+$summaryMetrics += "<div class='metric'><div class='metric-label'>Patches</div><div class='metric-value'>$($inventory.Patches.Count)</div></div>"
+$summaryMetrics += "<div class='metric'><div class='metric-label'>Established Connections</div><div class='metric-value'>$($inventory.EstablishedConnections.Count)</div></div>"
 
 $summaryTable = @(
   [pscustomobject]@{ Category="System"; Key="Computer Name"; Value=$sys.ComputerName },
@@ -1983,53 +1959,23 @@ if ($inventory.Metadata.ErrorCount -gt 0) {
   $errorSection = "<div class='section danger'><h2>[!] Collection Errors ($($inventory.Metadata.ErrorCount))</h2><p>Some data collection operations encountered errors. See <a href='csv/collection_errors.csv'>collection_errors.csv</a> for details.</p></div>"
 }
 
-$htmlContent = @"
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <title>Windows Inventory Report - $($sys.ComputerName)</title>
-  $htmlStyle
-</head>
-<body>
-  <div class="header">
-    <h1>Windows Inventory Report - CCDC Edition</h1>
-    <p><b>Computer:</b> $($sys.ComputerName) | <b>Collected:</b> $($inventory.Metadata.CollectedAt)</p>
-    <p><b>Duration:</b> $($inventory.Metadata.ExecutionTime.DurationSeconds)s | <b>Quick Mode:</b> $($inventory.Metadata.QuickMode)</p>
-  </div>
-
-  $threatSummary
-
-  $errorSection
-
-  <div class="section">
-    <h2>Summary Metrics</h2>
-    $summaryMetrics
-  </div>
-
-  <div class="section">
-    <h2>System Details</h2>
-    $summaryHtml
-  </div>
-
-  <div class="section">
-    <h2>Artifacts &amp; Reports</h2>
-    <p><b>JSON Summary:</b> <a href="inventory.json">inventory.json</a></p>
-    <p><b>Collection Log:</b> <a href="collection.log">collection.log</a></p>
-    $artifactLinks
-  </div>
-
-  <div class="footer">
-    <p>Generated by Get-WindowsInventory.ps1 v2.1 (CCDC Enhanced Edition)</p>
-    <p>Report Directory: $reportDir</p>
-    <p style="margin-top: 10px; font-size: 0.9em;">
-      <strong>CCDC Features:</strong> Automated threat detection, suspicious activity flagging,
-      security weakness identification, and actionable recommendations for defenders.
-    </p>
-  </div>
-</body>
-</html>
-"@
+$htmlContent = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Windows Inventory Report - $($sys.ComputerName)</title>$htmlStyle</head><body>"
+$htmlContent += "<div class='header'><h1>Windows Inventory Report - CCDC Edition</h1>"
+$htmlContent += "<p><b>Computer:</b> $($sys.ComputerName) | <b>Collected:</b> $($inventory.Metadata.CollectedAt)</p>"
+$htmlContent += "<p><b>Duration:</b> $($inventory.Metadata.ExecutionTime.DurationSeconds)s | <b>Quick Mode:</b> $($inventory.Metadata.QuickMode)</p></div>"
+$htmlContent += $errorSection
+$htmlContent += $threatSummary
+$htmlContent += "<div class='section'><h2>Summary Metrics</h2>$summaryMetrics</div>"
+$htmlContent += "<div class='section'><h2>System Details</h2>$summaryHtml</div>"
+$htmlContent += "<div class='section'><h2>Artifacts &amp; Reports</h2>"
+$htmlContent += "<p><b>JSON Summary:</b> <a href='inventory.json'>inventory.json</a></p>"
+$htmlContent += "<p><b>Collection Log:</b> <a href='collection.log'>collection.log</a></p>"
+$htmlContent += $artifactLinks
+$htmlContent += "</div>"
+$htmlContent += "<div class='footer'><p>Generated by Get-WindowsInventory.ps1 v2.1 (CCDC Enhanced Edition)</p>"
+$htmlContent += "<p>Report Directory: $reportDir</p>"
+$htmlContent += "<p style='margin-top: 10px; font-size: 0.9em;'><strong>CCDC Features:</strong> Automated threat detection, suspicious activity flagging, security weakness identification, and actionable recommendations for defenders.</p>"
+$htmlContent += "</div></body></html>"
 
 try {
   $htmlContent | Out-File -FilePath $htmlPath -Encoding UTF8 -Force
