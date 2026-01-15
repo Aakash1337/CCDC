@@ -908,12 +908,17 @@ function Get-ScheduledTasksInfo {
         $actionsText = ""
         if ($_.Actions) {
           $actionsText = (($_.Actions | ForEach-Object {
+            if (-not $_) { return "" }
             try {
               $exe = if ($_.PSObject.Properties['Execute']) { $_.Execute } else { "" }
               $args = if ($_.PSObject.Properties['Arguments']) { $_.Arguments } else { "" }
-              if ($exe) { "$exe $args".Trim() } else { $_.ToString() }
+              if ($exe) {
+                "$exe $args".Trim()
+              } else {
+                try { $_.ToString() } catch { "" }
+              }
             } catch {
-              $_.ToString()
+              try { if ($_) { $_.ToString() } else { "" } } catch { "" }
             }
           }) -join "; ")
         }
@@ -926,7 +931,8 @@ function Get-ScheduledTasksInfo {
           Description  = $_.Description
           Actions      = $actionsText
           Triggers     = (($_.Triggers | ForEach-Object {
-            $_.ToString()
+            if (-not $_) { return "" }
+            try { $_.ToString() } catch { "" }
           }) -join "; ")
           LastRunTime  = $lastRunTime
           NextRunTime  = $nextRunTime
