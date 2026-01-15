@@ -2997,12 +2997,22 @@ if ($inventory.Metadata.ErrorCount -gt 0) {
 $javaScript = @'
 <script>
 // Tab Management
-function switchTab(tabName) {
+function switchTab(tabName, element) {
+  // Hide all tab contents
   document.querySelectorAll('.tab-content').forEach(tab => tab.classList.remove('active'));
+  // Remove active from all buttons
   document.querySelectorAll('.tab-nav button').forEach(btn => btn.classList.remove('active'));
-  document.getElementById(tabName).classList.add('active');
-  event.target.classList.add('active');
+  // Show selected tab
+  var selectedTab = document.getElementById(tabName);
+  if (selectedTab) {
+    selectedTab.classList.add('active');
+  }
+  // Mark button as active
+  if (element) {
+    element.classList.add('active');
+  }
 
+  // Lazy load data explorer
   if (tabName === 'data-explorer' && !window.explorerInitialized) {
     initDataExplorer();
     window.explorerInitialized = true;
@@ -3278,7 +3288,10 @@ window.compareReports = function() {
 
 // Initialize
 document.addEventListener('DOMContentLoaded', function() {
-  switchTab('dashboard');
+  var dashboardBtn = document.querySelector('.tab-nav button');
+  if (dashboardBtn) {
+    switchTab('dashboard', dashboardBtn);
+  }
 });
 </script>
 '@
@@ -3290,10 +3303,10 @@ $htmlContent += "<p><b>Duration:</b> $($inventory.Metadata.ExecutionTime.Duratio
 
 # Tab Navigation
 $htmlContent += "<nav class='tab-nav'><ul>"
-$htmlContent += "<li><button onclick=""switchTab('dashboard')"" class='active'>Dashboard</button></li>"
-$htmlContent += "<li><button onclick=""switchTab('baseline-comparison')"">Baseline Comparison</button></li>"
-$htmlContent += "<li><button onclick=""switchTab('data-explorer')"">Data Explorer</button></li>"
-$htmlContent += "<li><button onclick=""switchTab('report-comparison')"">Report Comparison</button></li>"
+$htmlContent += "<li><button onclick=""switchTab('dashboard', this)"" class='active'>Dashboard</button></li>"
+$htmlContent += "<li><button onclick=""switchTab('baseline-comparison', this)"">Baseline Comparison</button></li>"
+$htmlContent += "<li><button onclick=""switchTab('data-explorer', this)"">Data Explorer</button></li>"
+$htmlContent += "<li><button onclick=""switchTab('report-comparison', this)"">Report Comparison</button></li>"
 $htmlContent += "</ul></nav>"
 
 # Tab 1: Dashboard
