@@ -2579,7 +2579,140 @@ if ($baselineComparison) {
     "<div style='font-size: 1.2em; margin: 15px 0;'><strong>Total Changes: $totalChanges</strong></div>"
   }
 
-  $baselineSection = "<div class='section $changeClass'><h2>BASELINE COMPARISON (since $baselineDate)</h2>$statusText<div style='display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-top: 20px;'>$changeMetrics</div></div>"
+  # Generate detailed change tables
+  $detailedChanges = ""
+
+  # Helper function to create change table HTML
+  function Get-ChangeTableHtml {
+    param(
+      [string]$CategoryName,
+      [string]$CsvPath,
+      [array]$AddedItems,
+      [array]$RemovedItems,
+      [string]$IconColor = "#856404"
+    )
+
+    if (-not $CsvPath -or -not (Test-Path $CsvPath)) {
+      return ""
+    }
+
+    try {
+      $changeData = Import-Csv $CsvPath
+      if ($changeData.Count -eq 0) { return "" }
+
+      $html = "<details style='margin: 20px 0; border: 1px solid #ddd; border-radius: 5px; padding: 10px; background: rgba(255,255,255,0.5);'>"
+      $html += "<summary style='cursor: pointer; font-weight: bold; font-size: 1.1em; color: $IconColor; padding: 5px;'>&#9658; $CategoryName Changes ($($changeData.Count) total: +$($AddedItems.Count) / -$($RemovedItems.Count))</summary>"
+      $html += "<div style='margin-top: 15px;'>"
+
+      # Added items section
+      if ($AddedItems.Count -gt 0) {
+        $html += "<div style='margin-bottom: 20px;'>"
+        $html += "<h4 style='color: #28a745; margin-bottom: 10px;'>&#10133; Added ($($AddedItems.Count))</h4>"
+        $html += "<div style='overflow-x: auto;'><table style='width: 100%; border-collapse: collapse; font-size: 0.9em;'>"
+
+        # Get column headers from first added item
+        $addedData = $changeData | Where-Object { $_.Change -eq "ADDED" }
+        if ($addedData.Count -gt 0) {
+          $columns = ($addedData | Select-Object -First 1).PSObject.Properties.Name | Where-Object { $_ -ne "Change" }
+          $html += "<thead><tr style='background: #d4edda; border-bottom: 2px solid #28a745;'>"
+          foreach ($col in $columns) {
+            $html += "<th style='padding: 8px; text-align: left; border: 1px solid #c3e6cb;'>$col</th>"
+          }
+          $html += "</tr></thead><tbody>"
+
+          foreach ($row in $addedData) {
+            $html += "<tr style='border-bottom: 1px solid #d4edda;'>"
+            foreach ($col in $columns) {
+              $value = $row.$col
+              if ([string]::IsNullOrWhiteSpace($value)) { $value = "-" }
+              $displayValue = if ($value.Length -gt 80) { $value.Substring(0, 77) + "..." } else { $value }
+              $html += "<td style='padding: 6px 8px; border: 1px solid #d4edda;' title='$([System.Web.HttpUtility]::HtmlEncode($value))'>$([System.Web.HttpUtility]::HtmlEncode($displayValue))</td>"
+            }
+            $html += "</tr>"
+          }
+          $html += "</tbody>"
+        }
+        $html += "</table></div></div>"
+      }
+
+      # Removed items section
+      if ($RemovedItems.Count -gt 0) {
+        $html += "<div style='margin-bottom: 10px;'>"
+        $html += "<h4 style='color: #dc3545; margin-bottom: 10px;'>&#10134; Removed ($($RemovedItems.Count))</h4>"
+        $html += "<div style='overflow-x: auto;'><table style='width: 100%; border-collapse: collapse; font-size: 0.9em;'>"
+
+        # Get column headers from first removed item
+        $removedData = $changeData | Where-Object { $_.Change -eq "REMOVED" }
+        if ($removedData.Count -gt 0) {
+          $columns = ($removedData | Select-Object -First 1).PSObject.Properties.Name | Where-Object { $_ -ne "Change" }
+          $html += "<thead><tr style='background: #f8d7da; border-bottom: 2px solid #dc3545;'>"
+          foreach ($col in $columns) {
+            $html += "<th style='padding: 8px; text-align: left; border: 1px solid #f5c6cb;'>$col</th>"
+          }
+          $html += "</tr></thead><tbody>"
+
+          foreach ($row in $removedData) {
+            $html += "<tr style='border-bottom: 1px solid #f8d7da;'>"
+            foreach ($col in $columns) {
+              $value = $row.$col
+              if ([string]::IsNullOrWhiteSpace($value)) { $value = "-" }
+              $displayValue = if ($value.Length -gt 80) { $value.Substring(0, 77) + "..." } else { $value }
+              $html += "<td style='padding: 6px 8px; border: 1px solid #f8d7da;' title='$([System.Web.HttpUtility]::HtmlEncode($value))'>$([System.Web.HttpUtility]::HtmlEncode($displayValue))</td>"
+            }
+            $html += "</tr>"
+          }
+          $html += "</tbody>"
+        }
+        $html += "</table></div></div>"
+      }
+
+      $csvRelPath = $CsvPath.Replace($reportDir + "\", "")
+      $html += "<div style='margin-top: 10px; text-align: right;'><a href='$csvRelPath' style='color: $IconColor; text-decoration: none;'>&#128190; Download Full CSV</a></div>"
+      $html += "</div></details>"
+
+      return $html
+    } catch {
+      return ""
+    }
+  }
+
+  # Add System.Web assembly for HTML encoding
+  Add-Type -AssemblyName System.Web
+
+  # Generate detailed tables for each category
+  if ($baselineComparison.Processes.Count -gt 0) {
+    $detailedChanges += Get-ChangeTableHtml -CategoryName "Processes" -CsvPath $baselineComparison.Processes.Csv -AddedItems $baselineComparison.Processes.Added -RemovedItems $baselineComparison.Processes.Removed -IconColor "#856404"
+  }
+
+  if ($baselineComparison.Services.Count -gt 0) {
+    $detailedChanges += Get-ChangeTableHtml -CategoryName "Services" -CsvPath $baselineComparison.Services.Csv -AddedItems $baselineComparison.Services.Added -RemovedItems $baselineComparison.Services.Removed -IconColor "#856404"
+  }
+
+  if ($baselineComparison.Tasks.Count -gt 0) {
+    $detailedChanges += Get-ChangeTableHtml -CategoryName "Scheduled Tasks" -CsvPath $baselineComparison.Tasks.Csv -AddedItems $baselineComparison.Tasks.Added -RemovedItems $baselineComparison.Tasks.Removed -IconColor "#856404"
+  }
+
+  if ($baselineComparison.Users.Count -gt 0) {
+    $detailedChanges += Get-ChangeTableHtml -CategoryName "Users" -CsvPath $baselineComparison.Users.Csv -AddedItems $baselineComparison.Users.Added -RemovedItems $baselineComparison.Users.Removed -IconColor "#856404"
+  }
+
+  if ($baselineComparison.Admins.Count -gt 0) {
+    $detailedChanges += Get-ChangeTableHtml -CategoryName "ADMINISTRATORS" -CsvPath $baselineComparison.Admins.Csv -AddedItems $baselineComparison.Admins.Added -RemovedItems $baselineComparison.Admins.Removed -IconColor "#721c24"
+  }
+
+  if ($baselineComparison.Software.Count -gt 0) {
+    $detailedChanges += Get-ChangeTableHtml -CategoryName "Software" -CsvPath $baselineComparison.Software.Csv -AddedItems $baselineComparison.Software.Added -RemovedItems $baselineComparison.Software.Removed -IconColor "#0c5460"
+  }
+
+  if ($baselineComparison.Autoruns.Count -gt 0) {
+    $detailedChanges += Get-ChangeTableHtml -CategoryName "Autoruns" -CsvPath $baselineComparison.Autoruns.Csv -AddedItems $baselineComparison.Autoruns.Added -RemovedItems $baselineComparison.Autoruns.Removed -IconColor "#856404"
+  }
+
+  if ($baselineComparison.Shares.Count -gt 0) {
+    $detailedChanges += Get-ChangeTableHtml -CategoryName "Network Shares" -CsvPath $baselineComparison.Shares.Csv -AddedItems $baselineComparison.Shares.Added -RemovedItems $baselineComparison.Shares.Removed -IconColor "#856404"
+  }
+
+  $baselineSection = "<div class='section $changeClass'><h2>BASELINE COMPARISON (since $baselineDate)</h2>$statusText<div style='display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-top: 20px;'>$changeMetrics</div>$detailedChanges</div>"
 }
 
 # Ensure $sys and $sec are valid with default properties
