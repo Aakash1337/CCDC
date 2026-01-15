@@ -277,21 +277,31 @@ function Test-SuspiciousProcess {
   param([object]$Process)
 
   $suspicious = @()
-  $path = if ($Process.Path) { $Process.Path } else { $Process.ExecutablePath }
 
-  # Check for suspicious paths
-  if ($path -match '(temp|appdata\\local\\temp|public|programdata|users\\public|windows\\temp)') {
-    $suspicious += "Running from suspicious location: $path"
+  # Get path from either Path or ExecutablePath property, handling null
+  $path = $null
+  if ($Process.PSObject.Properties['Path'] -and $Process.Path) {
+    $path = $Process.Path
+  } elseif ($Process.PSObject.Properties['ExecutablePath'] -and $Process.ExecutablePath) {
+    $path = $Process.ExecutablePath
   }
 
-  # Check for suspicious names
+  # Only check paths if we have one
+  if ($path) {
+    # Check for suspicious paths
+    if ($path -match '(temp|appdata\\local\\temp|public|programdata|users\\public|windows\\temp)') {
+      $suspicious += "Running from suspicious location: $path"
+    }
+
+    # Check for double extensions
+    if ($path -match '\.(pdf|doc|xls|jpg|png|txt)\.(exe|scr|pif|bat|cmd|vbs|js)$') {
+      $suspicious += "Double extension detected: $path"
+    }
+  }
+
+  # Check for suspicious names (always available)
   if ($Process.Name -match '^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32)$') {
     $suspicious += "Suspicious process name: $($Process.Name)"
-  }
-
-  # Check for double extensions
-  if ($path -match '\.(pdf|doc|xls|jpg|png|txt)\.(exe|scr|pif|bat|cmd|vbs|js)$') {
-    $suspicious += "Double extension detected: $path"
   }
 
   return ,$suspicious
@@ -564,6 +574,13 @@ function Get-SystemSummary {
     $installDate = [Management.ManagementDateTimeConverter]::ToDateTime($os.InstallDate)
   } catch {}
 
+  $uptimeHours = $null
+  if ($lastBoot) {
+    try {
+      $uptimeHours = [math]::Round(((Get-Date) - $lastBoot).TotalHours, 2)
+    } catch {}
+  }
+
   $totalMemGB = $null
   try {
     $totalMemGB = [math]::Round(($cs.TotalPhysicalMemory / 1GB), 2)
@@ -581,11 +598,7 @@ function Get-SystemSummary {
     OSArchitecture       = $os.OSArchitecture
     InstallDate          = $installDate
     LastBootUpTime       = $lastBoot
-    UptimeHours          = (if ($lastBoot) {
-      [math]::Round(((Get-Date) - $lastBoot).TotalHours, 2)
-    } else {
-      $null
-    })
+    UptimeHours          = $uptimeHours
     BIOSVersion          = ($bios.SMBIOSBIOSVersion)
     BIOSSerial           = ($bios.SerialNumber)
     CPUName              = ($cpu | Select-Object -First 1 -ExpandProperty Name)
@@ -667,11 +680,14 @@ function Get-NetworkInfo {
 
 function Get-DNSCache {
   $cache = @()
-  
+
   if (Test-Command "Get-DnsClientCache") {
     try {
-      $cache = Get-DnsClientCache -ErrorAction Stop | 
+      $result = Get-DnsClientCache -ErrorAction Stop |
         Select-Object Entry, RecordName, RecordType, Data, TimeToLive
+      if ($result) {
+        $cache = @($result)
+      }
     } catch {
       Add-ErrorEntry -Function "Get-DNSCache" -Error "Failed to get DNS cache: $_"
     }
@@ -679,8 +695,8 @@ function Get-DNSCache {
     $raw = (Invoke-ExeCapture -File "ipconfig" -Args @("/displaydns")).StdOut
     $cache = @([pscustomobject]@{ Note="ipconfig /displaydns raw"; Raw=$raw })
   }
-  
-  return $cache
+
+  return ,$cache
 }
 
 function Get-OpenPortsAndNetstat {
@@ -749,7 +765,7 @@ function Get-NetworkConnectionsEnhanced {
     }
   }
   
-  return $connections
+  return ,$connections
 }
 
 function Get-ServicesAndProcesses {
@@ -879,25 +895,30 @@ function Get-ScheduledTasksInfo {
     try {
       $tasks = Get-ScheduledTask -ErrorAction Stop | ForEach-Object {
         $info = $null
-        try { 
+        try {
           $info = Get-ScheduledTaskInfo -TaskName $_.TaskName -TaskPath $_.TaskPath -ErrorAction SilentlyContinue
         } catch {}
-        
+
+        # Pre-calculate values to avoid inline if statements
+        $lastRunTime = if ($info) { $info.LastRunTime } else { $null }
+        $nextRunTime = if ($info) { $info.NextRunTime } else { $null }
+        $lastTaskResult = if ($info) { $info.LastTaskResult } else { $null }
+
         [pscustomobject]@{
           TaskName     = $_.TaskName
           TaskPath     = $_.TaskPath
           State        = $_.State
           Author       = $_.Author
           Description  = $_.Description
-          Actions      = (($_.Actions | ForEach-Object { 
-            "$($_.Execute) $($_.Arguments)" 
+          Actions      = (($_.Actions | ForEach-Object {
+            "$($_.Execute) $($_.Arguments)"
           }) -join "; ")
-          Triggers     = (($_.Triggers | ForEach-Object { 
-            $_.ToString() 
+          Triggers     = (($_.Triggers | ForEach-Object {
+            $_.ToString()
           }) -join "; ")
-          LastRunTime  = (if ($info) { $info.LastRunTime } else { $null })
-          NextRunTime  = (if ($info) { $info.NextRunTime } else { $null })
-          LastTaskResult = (if ($info) { $info.LastTaskResult } else { $null })
+          LastRunTime  = $lastRunTime
+          NextRunTime  = $nextRunTime
+          LastTaskResult = $lastTaskResult
         }
       }
     } catch {
@@ -920,7 +941,7 @@ function Get-ScheduledTasksInfo {
     }
   }
 
-  return $tasks
+  return ,$tasks
 }
 
 function Get-AutorunsInfo {
@@ -983,7 +1004,7 @@ function Get-AutorunsInfo {
     } catch {}
   }
   
-  return $autoruns
+  return ,$autoruns
 }
 
 function Get-PersistenceLocations {
@@ -1068,7 +1089,7 @@ function Get-PatchInfo {
   } catch {
     Add-ErrorEntry -Function "Get-PatchInfo" -Error "Failed to get hotfix info: $_"
   }
-  return $hotfix
+  return ,$hotfix
 }
 
 function Get-FirewallInfo {
@@ -1195,7 +1216,7 @@ function Get-SharesInfo {
       Raw=$raw 
     })
   }
-  return $shares
+  return ,$shares
 }
 
 function Get-CertificatesLocalMachine {
@@ -1223,7 +1244,7 @@ function Get-CertificatesLocalMachine {
   } catch {
     Add-ErrorEntry -Function "Get-CertificatesLocalMachine" -Error "Failed to get certificates: $_"
   }
-  return $certs
+  return ,$certs
 }
 
 function Get-CriticalFileHashes {
@@ -1249,7 +1270,7 @@ function Get-CriticalFileHashes {
     }
   }
   
-  return $hashes
+  return ,$hashes
 }
 
 function Get-EventLogSummary24h {
@@ -1284,7 +1305,7 @@ function Get-EventLogSummary24h {
       }
     }
   }
-  return $summaries
+  return ,$summaries
 }
 
 # ---------------------------- Main Execution ----------------------------
@@ -1916,9 +1937,38 @@ if ($totalThreats -gt 0 -or $criticalWeaknesses -gt 0) {
   $threatSummary = "<div class='section $threatClass'><h2>[!] CCDC THREAT ANALYSIS - IMMEDIATE ATTENTION REQUIRED</h2><div style='font-size: 1.2em; margin: 15px 0;'><strong>Total Suspicious Items: $totalThreats</strong> | <strong>Critical Security Issues: $criticalWeaknesses</strong></div><div style='display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-top: 20px;'>$threatMetrics</div><div style='margin-top: 20px; padding: 15px; background: rgba(255,255,255,0.3); border-radius: 5px;'><strong>Next Steps:</strong><ol style='margin: 10px 0;'><li>Review all suspicious items in the CSV files linked above</li><li>Investigate processes, services, and tasks running from unusual locations</li><li>Verify all network connections, especially to uncommon ports</li><li>Check unauthorized administrators and remove if needed</li><li>Address critical security weaknesses immediately (Defender, Firewall, UAC)</li><li>Review recent system file modifications for unauthorized changes</li></ol></div></div>"
 }
 
-# Ensure $sys and $sec are valid
-if (-not $sys) { $sys = [pscustomobject]@{} }
-if (-not $sec) { $sec = [pscustomobject]@{ UAC = @{}; RDP_DenyTSConnections = $null } }
+# Ensure $sys and $sec are valid with default properties
+if (-not $sys) {
+  $sys = [pscustomobject]@{
+    ComputerName = $env:COMPUTERNAME
+    Domain = $null
+    PartOfDomain = $false
+    Manufacturer = $null
+    Model = $null
+    OSName = $null
+    OSVersion = $null
+    OSBuildNumber = $null
+    OSArchitecture = $null
+    InstallDate = $null
+    LastBootUpTime = $null
+    UptimeHours = $null
+    BIOSVersion = $null
+    BIOSSerial = $null
+    CPUName = $null
+    CPUCores = $null
+    CPULogicalProcessors = $null
+    TotalMemoryGB = $null
+    IsAdmin = $false
+    TimeCollected = (Get-Date).ToString("o")
+  }
+}
+
+if (-not $sec) {
+  $sec = [pscustomobject]@{
+    UAC = [pscustomobject]@{ EnableLUA = $null }
+    RDP_DenyTSConnections = $null
+  }
+}
 
 $adminClass = if ($sys.IsAdmin) { 'success' } else { 'warning' }
 $adminText = if ($sys.IsAdmin) { 'YES' } else { 'NO' }
