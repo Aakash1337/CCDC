@@ -1888,7 +1888,7 @@ if ($totalThreats -gt 0 -or $criticalWeaknesses -gt 0) {
   $threatClass = if ($criticalWeaknesses -gt 0) { "danger" } elseif ($totalThreats -gt 5) { "warning" } else { "info" }
   $threatSummary = @"
 <div class="section $threatClass">
-  <h2>⚠️ CCDC THREAT ANALYSIS - IMMEDIATE ATTENTION REQUIRED</h2>
+  <h2>[!] CCDC THREAT ANALYSIS - IMMEDIATE ATTENTION REQUIRED</h2>
   <div style="font-size: 1.2em; margin: 15px 0;">
     <strong>Total Suspicious Items: $totalThreats</strong> |
     <strong>Critical Security Issues: $criticalWeaknesses</strong>
@@ -1945,7 +1945,7 @@ if ($totalThreats -gt 0 -or $criticalWeaknesses -gt 0) {
     })
   </div>
   <div style="margin-top: 20px; padding: 15px; background: rgba(255,255,255,0.3); border-radius: 5px;">
-    <strong>🔍 Next Steps:</strong>
+    <strong>Next Steps:</strong>
     <ol style="margin: 10px 0;">
       <li>Review all suspicious items in the CSV files linked above</li>
       <li>Investigate processes, services, and tasks running from unusual locations</li>
@@ -2028,7 +2028,7 @@ $errorSection = ""
 if ($inventory.Metadata.ErrorCount -gt 0) {
   $errorSection = @"
 <div class="section danger">
-  <h2>⚠ Collection Errors ($($inventory.Metadata.ErrorCount))</h2>
+  <h2>[!] Collection Errors ($($inventory.Metadata.ErrorCount))</h2>
   <p>Some data collection operations encountered errors. See <a href="csv/collection_errors.csv">collection_errors.csv</a> for details.</p>
 </div>
 "@
@@ -2044,7 +2044,7 @@ $htmlContent = @"
 </head>
 <body>
   <div class="header">
-    <h1>🖥 Windows Inventory Report - CCDC Edition</h1>
+    <h1>Windows Inventory Report - CCDC Edition</h1>
     <p><b>Computer:</b> $($sys.ComputerName) | <b>Collected:</b> $($inventory.Metadata.CollectedAt)</p>
     <p><b>Duration:</b> $($inventory.Metadata.ExecutionTime.DurationSeconds)s | <b>Quick Mode:</b> $($inventory.Metadata.QuickMode)</p>
   </div>
@@ -2054,17 +2054,17 @@ $htmlContent = @"
   $errorSection
 
   <div class="section">
-    <h2>📊 Summary Metrics</h2>
+    <h2>Summary Metrics</h2>
     $summaryMetrics
   </div>
 
   <div class="section">
-    <h2>📋 System Details</h2>
+    <h2>System Details</h2>
     $summaryHtml
   </div>
 
   <div class="section">
-    <h2>📁 Artifacts & Reports</h2>
+    <h2>Artifacts &amp; Reports</h2>
     <p><b>JSON Summary:</b> <a href="inventory.json">inventory.json</a></p>
     <p><b>Collection Log:</b> <a href="collection.log">collection.log</a></p>
     $artifactLinks
