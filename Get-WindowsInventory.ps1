@@ -46,7 +46,8 @@
 
 .NOTES
   Run as Administrator for best coverage (SecurityCenter2, some registry keys, firewall rules, etc.).
-  Version: 2.0
+  CCDC READY: Includes threat detection, suspicious activity flagging, and security baseline checks.
+  Version: 2.1 (CCDC Enhanced)
 #>
 
 [CmdletBinding()]
@@ -68,7 +69,7 @@ $ErrorActionPreference = 'Continue'
 $script:LogPath = $null
 $script:ErrorLog = @()
 $script:StartTime = Get-Date
-$script:TotalSteps = 20
+$script:TotalSteps = 25
 $script:CurrentStep = 0
 
 # ---------------------------- Helpers ----------------------------
@@ -268,6 +269,250 @@ function Compress-ReportFolder {
   }
   
   return $null
+}
+
+# ---------------------------- CCDC Threat Detection Functions ----------------------------
+
+function Test-SuspiciousProcess {
+  param([object]$Process)
+
+  $suspicious = @()
+  $path = if ($Process.Path) { $Process.Path } else { $Process.ExecutablePath }
+
+  # Check for suspicious paths
+  if ($path -match '(temp|appdata\\local\\temp|public|programdata|users\\public|windows\\temp)') {
+    $suspicious += "Running from suspicious location: $path"
+  }
+
+  # Check for suspicious names
+  if ($Process.Name -match '^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32)$') {
+    $suspicious += "Suspicious process name: $($Process.Name)"
+  }
+
+  # Check for double extensions
+  if ($path -match '\.(pdf|doc|xls|jpg|png|txt)\.(exe|scr|pif|bat|cmd|vbs|js)$') {
+    $suspicious += "Double extension detected: $path"
+  }
+
+  return $suspicious
+}
+
+function Test-SuspiciousService {
+  param([object]$Service)
+
+  $suspicious = @()
+  $path = $Service.PathName
+
+  # Check for suspicious paths
+  if ($path -match '(temp|appdata|public|programdata|users)' -and $Service.StartMode -eq 'Auto') {
+    $suspicious += "Auto-start service in user directory: $path"
+  }
+
+  # Check for services running as SYSTEM from suspicious locations
+  if ($Service.StartName -eq 'LocalSystem' -and $path -match '(users|temp)') {
+    $suspicious += "SYSTEM service in user directory: $path"
+  }
+
+  # Check for encoded commands
+  if ($path -match '-enc|-encodedcommand') {
+    $suspicious += "Service using encoded commands: $path"
+  }
+
+  return $suspicious
+}
+
+function Test-SuspiciousScheduledTask {
+  param([object]$Task)
+
+  $suspicious = @()
+  $actions = $Task.Actions
+
+  # Check for suspicious actions
+  if ($actions -match '(temp|appdata\\local\\temp|public|programdata\\public)') {
+    $suspicious += "Task runs from suspicious location: $actions"
+  }
+
+  # Check for PowerShell with encoded commands
+  if ($actions -match 'powershell.*(-enc|-encodedcommand|-w hidden|-windowstyle hidden)') {
+    $suspicious += "Task uses hidden/encoded PowerShell: $actions"
+  }
+
+  # Check for tasks running as SYSTEM
+  if ($Task.TaskPath -match '\\Microsoft\\Windows\\' -and $Task.Author -notmatch 'Microsoft') {
+    $suspicious += "Non-Microsoft task in Microsoft folder: $($Task.TaskPath)"
+  }
+
+  return $suspicious
+}
+
+function Test-UnauthorizedAdmin {
+  param([object]$GroupMember)
+
+  # Common legitimate admin accounts (customize for your environment)
+  $legitimateAdmins = @(
+    'Administrator',
+    'Domain Admins',
+    'Enterprise Admins'
+  )
+
+  if ($GroupMember.Group -match 'Administrators' -and
+      $GroupMember.Member -notmatch ($legitimateAdmins -join '|')) {
+    return $true
+  }
+
+  return $false
+}
+
+function Get-RecentFileModifications {
+  param([int]$Hours = 24)
+
+  $since = (Get-Date).AddHours(-$Hours)
+  $suspiciousPaths = @(
+    "$env:SystemRoot\System32\drivers\etc",
+    "$env:SystemRoot\System32\drivers",
+    "$env:SystemRoot\System32",
+    "$env:SystemRoot\SysWOW64"
+  )
+
+  $modifications = @()
+  foreach ($path in $suspiciousPaths) {
+    if (Test-Path $path) {
+      try {
+        $files = Get-ChildItem $path -File -ErrorAction SilentlyContinue |
+          Where-Object { $_.LastWriteTime -gt $since }
+
+        foreach ($file in $files) {
+          $modifications += [pscustomobject]@{
+            Path = $file.FullName
+            LastWriteTime = $file.LastWriteTime
+            Size = $file.Length
+            Hash = (Get-FileHashSafe $file.FullName)
+          }
+        }
+      } catch {}
+    }
+  }
+
+  return $modifications
+}
+
+function Get-SuspiciousNetworkConnections {
+  param([object[]]$Connections)
+
+  $suspicious = @()
+
+  foreach ($conn in $Connections) {
+    # Check for connections to common C2 ports
+    if ($conn.RemotePort -in @(4444, 5555, 6666, 7777, 8888, 31337, 1337)) {
+      $suspicious += [pscustomobject]@{
+        LocalAddress = $conn.LocalAddress
+        LocalPort = $conn.LocalPort
+        RemoteAddress = $conn.RemoteAddress
+        RemotePort = $conn.RemotePort
+        ProcessId = $conn.ProcessId
+        ProcessName = $conn.ProcessName
+        Reason = "Common C2 port: $($conn.RemotePort)"
+      }
+    }
+
+    # Check for non-standard ports on common processes
+    if ($conn.ProcessName -match '^(notepad|calc|mspaint)$' -and $conn.RemotePort -ne 0) {
+      $suspicious += [pscustomobject]@{
+        LocalAddress = $conn.LocalAddress
+        LocalPort = $conn.LocalPort
+        RemoteAddress = $conn.RemoteAddress
+        RemotePort = $conn.RemotePort
+        ProcessId = $conn.ProcessId
+        ProcessName = $conn.ProcessName
+        Reason = "Unusual process with network connection: $($conn.ProcessName)"
+      }
+    }
+  }
+
+  return $suspicious
+}
+
+function Get-SecurityWeaknesses {
+  $weaknesses = @()
+
+  # Check UAC
+  $uacEnabled = Get-RegistryValueSafe "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "EnableLUA"
+  if ($uacEnabled -ne 1) {
+    $weaknesses += [pscustomobject]@{
+      Category = "UAC"
+      Issue = "User Account Control is disabled"
+      Risk = "High"
+      Recommendation = "Enable UAC"
+    }
+  }
+
+  # Check RDP
+  $rdpDeny = Get-RegistryValueSafe "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" "fDenyTSConnections"
+  if ($rdpDeny -eq 0) {
+    $weaknesses += [pscustomobject]@{
+      Category = "RDP"
+      Issue = "Remote Desktop is enabled"
+      Risk = "Medium"
+      Recommendation = "Disable RDP if not needed, or restrict access"
+    }
+  }
+
+  # Check Windows Firewall
+  if (Test-Command "Get-NetFirewallProfile") {
+    try {
+      $profiles = Get-NetFirewallProfile -ErrorAction Stop
+      foreach ($profile in $profiles) {
+        if (-not $profile.Enabled) {
+          $weaknesses += [pscustomobject]@{
+            Category = "Firewall"
+            Issue = "Windows Firewall is disabled for $($profile.Name) profile"
+            Risk = "High"
+            Recommendation = "Enable Windows Firewall for all profiles"
+          }
+        }
+      }
+    } catch {}
+  }
+
+  # Check Windows Defender
+  if (Test-Command "Get-MpComputerStatus") {
+    try {
+      $defender = Get-MpComputerStatus -ErrorAction Stop
+      if (-not $defender.RealTimeProtectionEnabled) {
+        $weaknesses += [pscustomobject]@{
+          Category = "Antivirus"
+          Issue = "Windows Defender Real-Time Protection is disabled"
+          Risk = "Critical"
+          Recommendation = "Enable Real-Time Protection immediately"
+        }
+      }
+      if (-not $defender.AntivirusEnabled) {
+        $weaknesses += [pscustomobject]@{
+          Category = "Antivirus"
+          Issue = "Windows Defender is disabled"
+          Risk = "Critical"
+          Recommendation = "Enable Windows Defender immediately"
+        }
+      }
+    } catch {}
+  }
+
+  # Check Guest account
+  if (Test-Command "Get-LocalUser") {
+    try {
+      $guest = Get-LocalUser -Name "Guest" -ErrorAction SilentlyContinue
+      if ($guest -and $guest.Enabled) {
+        $weaknesses += [pscustomobject]@{
+          Category = "User Accounts"
+          Issue = "Guest account is enabled"
+          Risk = "Medium"
+          Recommendation = "Disable Guest account"
+        }
+      }
+    } catch {}
+  }
+
+  return $weaknesses
 }
 
 # ---------------------------- Collection Functions ----------------------------
@@ -1064,7 +1309,7 @@ Write-LogEntry "Running as Administrator: $(Is-Admin)"
 $inventory = [ordered]@{
   Metadata = [ordered]@{
     ScriptName       = "Get-WindowsInventory.ps1"
-    Version          = "2.0"
+    Version          = "2.1-CCDC"
     QuickMode        = [bool]$Quick
     IncludeEventLogs = [bool]$IncludeEventLogs
     CollectedAt      = (Get-Date).ToString("o")
@@ -1097,6 +1342,15 @@ $inventory = [ordered]@{
   CriticalFiles = [ordered]@{ Csv = $null; Count = 0 }
   Artifacts  = [ordered]@{}
   FileHashes = [ordered]@{}
+  ThreatAnalysis = [ordered]@{
+    SuspiciousProcesses = [ordered]@{ Csv = $null; Count = 0 }
+    SuspiciousServices = [ordered]@{ Csv = $null; Count = 0 }
+    SuspiciousTasks = [ordered]@{ Csv = $null; Count = 0 }
+    SuspiciousConnections = [ordered]@{ Csv = $null; Count = 0 }
+    UnauthorizedAdmins = [ordered]@{ Csv = $null; Count = 0 }
+    SecurityWeaknesses = [ordered]@{ Csv = $null; Count = 0 }
+    RecentModifications = [ordered]@{ Csv = $null; Count = 0 }
+  }
 }
 
 # Step 1: System Summary
@@ -1354,7 +1608,141 @@ if ($IncludeEventLogs) {
   $inventory.Artifacts.EventLogSummary24h = $evCsv
 }
 
-# Step 20: Additional Baseline Artifacts
+# Step 20: CCDC Threat Analysis - Suspicious Processes
+Update-Progress "Analyzing processes for threats..."
+Write-LogEntry "Running threat analysis on processes"
+$suspiciousProcs = @()
+foreach ($proc in $sp.Processes) {
+  $findings = Test-SuspiciousProcess -Process $proc
+  if ($findings.Count -gt 0) {
+    $suspiciousProcs += [pscustomobject]@{
+      Name = $proc.Name
+      Id = $proc.Id
+      Path = if ($proc.Path) { $proc.Path } else { $proc.ExecutablePath }
+      CommandLine = $proc.CommandLine
+      Findings = ($findings -join "; ")
+    }
+  }
+}
+if ($suspiciousProcs.Count -gt 0) {
+  $suspProcCsv = Join-Path $csvDir "threat_suspicious_processes.csv"
+  Export-CsvSafe -Data $suspiciousProcs -Path $suspProcCsv
+  $inventory.ThreatAnalysis.SuspiciousProcesses.Csv = $suspProcCsv
+  $inventory.ThreatAnalysis.SuspiciousProcesses.Count = $suspiciousProcs.Count
+  Write-LogEntry "Found $($suspiciousProcs.Count) suspicious processes" -Level "WARN"
+}
+
+# Step 21: CCDC Threat Analysis - Suspicious Services
+Update-Progress "Analyzing services for threats..."
+Write-LogEntry "Running threat analysis on services"
+$suspiciousServices = @()
+foreach ($svc in $sp.Services) {
+  $findings = Test-SuspiciousService -Service $svc
+  if ($findings.Count -gt 0) {
+    $suspiciousServices += [pscustomobject]@{
+      Name = $svc.Name
+      DisplayName = $svc.DisplayName
+      State = $svc.State
+      StartMode = $svc.StartMode
+      PathName = $svc.PathName
+      StartName = $svc.StartName
+      Findings = ($findings -join "; ")
+    }
+  }
+}
+if ($suspiciousServices.Count -gt 0) {
+  $suspSvcCsv = Join-Path $csvDir "threat_suspicious_services.csv"
+  Export-CsvSafe -Data $suspiciousServices -Path $suspSvcCsv
+  $inventory.ThreatAnalysis.SuspiciousServices.Csv = $suspSvcCsv
+  $inventory.ThreatAnalysis.SuspiciousServices.Count = $suspiciousServices.Count
+  Write-LogEntry "Found $($suspiciousServices.Count) suspicious services" -Level "WARN"
+}
+
+# Step 22: CCDC Threat Analysis - Suspicious Scheduled Tasks
+Update-Progress "Analyzing scheduled tasks for threats..."
+Write-LogEntry "Running threat analysis on scheduled tasks"
+$suspiciousTasks = @()
+foreach ($task in $tasks) {
+  $findings = Test-SuspiciousScheduledTask -Task $task
+  if ($findings.Count -gt 0) {
+    $suspiciousTasks += [pscustomobject]@{
+      TaskName = $task.TaskName
+      TaskPath = $task.TaskPath
+      State = $task.State
+      Author = $task.Author
+      Actions = $task.Actions
+      Findings = ($findings -join "; ")
+    }
+  }
+}
+if ($suspiciousTasks.Count -gt 0) {
+  $suspTaskCsv = Join-Path $csvDir "threat_suspicious_tasks.csv"
+  Export-CsvSafe -Data $suspiciousTasks -Path $suspTaskCsv
+  $inventory.ThreatAnalysis.SuspiciousTasks.Csv = $suspTaskCsv
+  $inventory.ThreatAnalysis.SuspiciousTasks.Count = $suspiciousTasks.Count
+  Write-LogEntry "Found $($suspiciousTasks.Count) suspicious scheduled tasks" -Level "WARN"
+}
+
+# Step 23: CCDC Threat Analysis - Suspicious Network Connections
+Update-Progress "Analyzing network connections for threats..."
+Write-LogEntry "Running threat analysis on network connections"
+if ($enhancedConns.Count -gt 0) {
+  $suspConns = Get-SuspiciousNetworkConnections -Connections $enhancedConns
+  if ($suspConns.Count -gt 0) {
+    $suspConnCsv = Join-Path $csvDir "threat_suspicious_connections.csv"
+    Export-CsvSafe -Data $suspConns -Path $suspConnCsv
+    $inventory.ThreatAnalysis.SuspiciousConnections.Csv = $suspConnCsv
+    $inventory.ThreatAnalysis.SuspiciousConnections.Count = $suspConns.Count
+    Write-LogEntry "Found $($suspConns.Count) suspicious network connections" -Level "WARN"
+  }
+}
+
+# Step 24: CCDC Threat Analysis - Unauthorized Administrators
+Update-Progress "Checking for unauthorized administrators..."
+Write-LogEntry "Checking for unauthorized administrators"
+$unauthorizedAdmins = @()
+foreach ($member in $ug.GroupMembers) {
+  if (Test-UnauthorizedAdmin -GroupMember $member) {
+    $unauthorizedAdmins += $member
+  }
+}
+if ($unauthorizedAdmins.Count -gt 0) {
+  $unauthAdminCsv = Join-Path $csvDir "threat_unauthorized_admins.csv"
+  Export-CsvSafe -Data $unauthorizedAdmins -Path $unauthAdminCsv
+  $inventory.ThreatAnalysis.UnauthorizedAdmins.Csv = $unauthAdminCsv
+  $inventory.ThreatAnalysis.UnauthorizedAdmins.Count = $unauthorizedAdmins.Count
+  Write-LogEntry "Found $($unauthorizedAdmins.Count) potentially unauthorized administrators" -Level "WARN"
+}
+
+# Step 25: CCDC Security Weaknesses and Recent Modifications
+Update-Progress "Checking security configuration weaknesses..."
+Write-LogEntry "Checking security configuration weaknesses"
+$secWeaknesses = Get-SecurityWeaknesses
+if ($secWeaknesses.Count -gt 0) {
+  $weaknessCsv = Join-Path $csvDir "security_weaknesses.csv"
+  Export-CsvSafe -Data $secWeaknesses -Path $weaknessCsv
+  $inventory.ThreatAnalysis.SecurityWeaknesses.Csv = $weaknessCsv
+  $inventory.ThreatAnalysis.SecurityWeaknesses.Count = $secWeaknesses.Count
+  Write-LogEntry "Found $($secWeaknesses.Count) security weaknesses" -Level "WARN"
+
+  # Log critical weaknesses to console
+  $critical = $secWeaknesses | Where-Object { $_.Risk -eq 'Critical' }
+  if ($critical) {
+    Write-LogEntry "CRITICAL: $($critical.Count) critical security issues found!" -Level "ERROR"
+  }
+}
+
+Write-LogEntry "Checking for recent system file modifications (last 24h)"
+$recentMods = Get-RecentFileModifications -Hours 24
+if ($recentMods.Count -gt 0) {
+  $recentModCsv = Join-Path $csvDir "recent_system_modifications_24h.csv"
+  Export-CsvSafe -Data $recentMods -Path $recentModCsv
+  $inventory.ThreatAnalysis.RecentModifications.Csv = $recentModCsv
+  $inventory.ThreatAnalysis.RecentModifications.Count = $recentMods.Count
+  Write-LogEntry "Found $($recentMods.Count) recent modifications to system directories" -Level "INFO"
+}
+
+# Step 26: Additional Baseline Artifacts
 Update-Progress "Collecting baseline text artifacts..."
 Write-LogEntry "Collecting baseline text artifacts"
 $sysinfoPath = Join-Path $artDir "systeminfo.txt"
@@ -1483,6 +1871,94 @@ $htmlStyle = @"
 </style>
 "@
 
+$threatSummary = ""
+$totalThreats = $inventory.ThreatAnalysis.SuspiciousProcesses.Count +
+                $inventory.ThreatAnalysis.SuspiciousServices.Count +
+                $inventory.ThreatAnalysis.SuspiciousTasks.Count +
+                $inventory.ThreatAnalysis.SuspiciousConnections.Count +
+                $inventory.ThreatAnalysis.UnauthorizedAdmins.Count
+
+$criticalWeaknesses = 0
+if ($inventory.ThreatAnalysis.SecurityWeaknesses.Count -gt 0) {
+  $weaknessData = Import-Csv $inventory.ThreatAnalysis.SecurityWeaknesses.Csv -ErrorAction SilentlyContinue
+  $criticalWeaknesses = ($weaknessData | Where-Object { $_.Risk -eq 'Critical' }).Count
+}
+
+if ($totalThreats -gt 0 -or $criticalWeaknesses -gt 0) {
+  $threatClass = if ($criticalWeaknesses -gt 0) { "danger" } elseif ($totalThreats -gt 5) { "warning" } else { "info" }
+  $threatSummary = @"
+<div class="section $threatClass">
+  <h2>⚠️ CCDC THREAT ANALYSIS - IMMEDIATE ATTENTION REQUIRED</h2>
+  <div style="font-size: 1.2em; margin: 15px 0;">
+    <strong>Total Suspicious Items: $totalThreats</strong> |
+    <strong>Critical Security Issues: $criticalWeaknesses</strong>
+  </div>
+  <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-top: 20px;">
+    $(if ($inventory.ThreatAnalysis.SuspiciousProcesses.Count -gt 0) {
+      "<div class='metric danger'>
+        <div class='metric-label'>Suspicious Processes</div>
+        <div class='metric-value'>$($inventory.ThreatAnalysis.SuspiciousProcesses.Count)</div>
+        <div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_suspicious_processes.csv' style='color: #721c24;'>View Details</a></div>
+      </div>"
+    })
+    $(if ($inventory.ThreatAnalysis.SuspiciousServices.Count -gt 0) {
+      "<div class='metric danger'>
+        <div class='metric-label'>Suspicious Services</div>
+        <div class='metric-value'>$($inventory.ThreatAnalysis.SuspiciousServices.Count)</div>
+        <div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_suspicious_services.csv' style='color: #721c24;'>View Details</a></div>
+      </div>"
+    })
+    $(if ($inventory.ThreatAnalysis.SuspiciousTasks.Count -gt 0) {
+      "<div class='metric danger'>
+        <div class='metric-label'>Suspicious Scheduled Tasks</div>
+        <div class='metric-value'>$($inventory.ThreatAnalysis.SuspiciousTasks.Count)</div>
+        <div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_suspicious_tasks.csv' style='color: #721c24;'>View Details</a></div>
+      </div>"
+    })
+    $(if ($inventory.ThreatAnalysis.SuspiciousConnections.Count -gt 0) {
+      "<div class='metric danger'>
+        <div class='metric-label'>Suspicious Network Connections</div>
+        <div class='metric-value'>$($inventory.ThreatAnalysis.SuspiciousConnections.Count)</div>
+        <div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_suspicious_connections.csv' style='color: #721c24;'>View Details</a></div>
+      </div>"
+    })
+    $(if ($inventory.ThreatAnalysis.UnauthorizedAdmins.Count -gt 0) {
+      "<div class='metric danger'>
+        <div class='metric-label'>Unauthorized Admins</div>
+        <div class='metric-value'>$($inventory.ThreatAnalysis.UnauthorizedAdmins.Count)</div>
+        <div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_unauthorized_admins.csv' style='color: #721c24;'>View Details</a></div>
+      </div>"
+    })
+    $(if ($criticalWeaknesses -gt 0) {
+      "<div class='metric danger'>
+        <div class='metric-label'>Critical Security Issues</div>
+        <div class='metric-value'>$criticalWeaknesses</div>
+        <div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/security_weaknesses.csv' style='color: #721c24;'>View Details</a></div>
+      </div>"
+    })
+    $(if ($inventory.ThreatAnalysis.RecentModifications.Count -gt 0) {
+      "<div class='metric warning'>
+        <div class='metric-label'>Recent System File Changes (24h)</div>
+        <div class='metric-value'>$($inventory.ThreatAnalysis.RecentModifications.Count)</div>
+        <div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/recent_system_modifications_24h.csv' style='color: #856404;'>View Details</a></div>
+      </div>"
+    })
+  </div>
+  <div style="margin-top: 20px; padding: 15px; background: rgba(255,255,255,0.3); border-radius: 5px;">
+    <strong>🔍 Next Steps:</strong>
+    <ol style="margin: 10px 0;">
+      <li>Review all suspicious items in the CSV files linked above</li>
+      <li>Investigate processes, services, and tasks running from unusual locations</li>
+      <li>Verify all network connections, especially to uncommon ports</li>
+      <li>Check unauthorized administrators and remove if needed</li>
+      <li>Address critical security weaknesses immediately (Defender, Firewall, UAC)</li>
+      <li>Review recent system file modifications for unauthorized changes</li>
+    </ol>
+  </div>
+</div>
+"@
+}
+
 $summaryMetrics = @"
 <div class="metric $(if ($sys.IsAdmin) { 'success' } else { 'warning' })">
   <div class="metric-label">Admin Rights</div>
@@ -1568,10 +2044,12 @@ $htmlContent = @"
 </head>
 <body>
   <div class="header">
-    <h1>🖥 Windows Inventory Report</h1>
+    <h1>🖥 Windows Inventory Report - CCDC Edition</h1>
     <p><b>Computer:</b> $($sys.ComputerName) | <b>Collected:</b> $($inventory.Metadata.CollectedAt)</p>
     <p><b>Duration:</b> $($inventory.Metadata.ExecutionTime.DurationSeconds)s | <b>Quick Mode:</b> $($inventory.Metadata.QuickMode)</p>
   </div>
+
+  $threatSummary
 
   $errorSection
 
@@ -1593,8 +2071,12 @@ $htmlContent = @"
   </div>
 
   <div class="footer">
-    <p>Generated by Get-WindowsInventory.ps1 v2.0</p>
+    <p>Generated by Get-WindowsInventory.ps1 v2.1 (CCDC Enhanced Edition)</p>
     <p>Report Directory: $reportDir</p>
+    <p style="margin-top: 10px; font-size: 0.9em;">
+      <strong>CCDC Features:</strong> Automated threat detection, suspicious activity flagging,
+      security weakness identification, and actionable recommendations for defenders.
+    </p>
   </div>
 </body>
 </html>
@@ -1665,4 +2147,69 @@ if ($inventory.Metadata.ErrorCount -gt 0) {
   Write-Host "Errors encountered: $($inventory.Metadata.ErrorCount) (see collection.log)" -ForegroundColor Red
 }
 
+Write-Host ""
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "  CCDC THREAT ANALYSIS SUMMARY" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+
+$totalThreatsConsole = $inventory.ThreatAnalysis.SuspiciousProcesses.Count +
+                       $inventory.ThreatAnalysis.SuspiciousServices.Count +
+                       $inventory.ThreatAnalysis.SuspiciousTasks.Count +
+                       $inventory.ThreatAnalysis.SuspiciousConnections.Count +
+                       $inventory.ThreatAnalysis.UnauthorizedAdmins.Count
+
+if ($totalThreatsConsole -gt 0) {
+  Write-Host ""
+  Write-Host "⚠ THREATS DETECTED: $totalThreatsConsole suspicious items found" -ForegroundColor Red
+  Write-Host ""
+
+  if ($inventory.ThreatAnalysis.SuspiciousProcesses.Count -gt 0) {
+    Write-Host "  [!] Suspicious Processes: $($inventory.ThreatAnalysis.SuspiciousProcesses.Count)" -ForegroundColor Yellow
+  }
+  if ($inventory.ThreatAnalysis.SuspiciousServices.Count -gt 0) {
+    Write-Host "  [!] Suspicious Services: $($inventory.ThreatAnalysis.SuspiciousServices.Count)" -ForegroundColor Yellow
+  }
+  if ($inventory.ThreatAnalysis.SuspiciousTasks.Count -gt 0) {
+    Write-Host "  [!] Suspicious Scheduled Tasks: $($inventory.ThreatAnalysis.SuspiciousTasks.Count)" -ForegroundColor Yellow
+  }
+  if ($inventory.ThreatAnalysis.SuspiciousConnections.Count -gt 0) {
+    Write-Host "  [!] Suspicious Network Connections: $($inventory.ThreatAnalysis.SuspiciousConnections.Count)" -ForegroundColor Yellow
+  }
+  if ($inventory.ThreatAnalysis.UnauthorizedAdmins.Count -gt 0) {
+    Write-Host "  [!] Potentially Unauthorized Admins: $($inventory.ThreatAnalysis.UnauthorizedAdmins.Count)" -ForegroundColor Yellow
+  }
+} else {
+  Write-Host ""
+  Write-Host "✓ No immediate threats detected" -ForegroundColor Green
+}
+
+if ($inventory.ThreatAnalysis.SecurityWeaknesses.Count -gt 0) {
+  Write-Host ""
+  Write-Host "⚠ SECURITY WEAKNESSES: $($inventory.ThreatAnalysis.SecurityWeaknesses.Count) configuration issues found" -ForegroundColor Yellow
+
+  # Show critical weaknesses
+  if (Test-Path $inventory.ThreatAnalysis.SecurityWeaknesses.Csv) {
+    $weaknessData = Import-Csv $inventory.ThreatAnalysis.SecurityWeaknesses.Csv
+    $criticalIssues = $weaknessData | Where-Object { $_.Risk -eq 'Critical' }
+    if ($criticalIssues) {
+      Write-Host ""
+      Write-Host "  CRITICAL ISSUES:" -ForegroundColor Red
+      foreach ($issue in $criticalIssues) {
+        Write-Host "    • $($issue.Issue)" -ForegroundColor Red
+        Write-Host "      → $($issue.Recommendation)" -ForegroundColor White
+      }
+    }
+  }
+}
+
+if ($inventory.ThreatAnalysis.RecentModifications.Count -gt 0) {
+  Write-Host ""
+  Write-Host "ℹ $($inventory.ThreatAnalysis.RecentModifications.Count) recent system file modifications (last 24h)" -ForegroundColor Cyan
+}
+
+Write-Host ""
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "📋 Review the HTML report for detailed threat analysis:" -ForegroundColor White
+Write-Host "   $htmlPath" -ForegroundColor Cyan
 Write-Host ""
