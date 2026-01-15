@@ -370,18 +370,19 @@ function Save-Baseline {
 function Compare-WithBaseline {
   param(
     [Parameter(Mandatory)][string]$BaselineDir,
-    [Parameter(Mandatory)][hashtable]$CurrentInventory
+    [Parameter(Mandatory)][hashtable]$CurrentInventory,
+    [Parameter(Mandatory)][string]$ComparisonCsvDir
   )
 
   $comparison = @{
-    Processes = @{ Added = @(); Removed = @(); Count = 0 }
-    Services = @{ Added = @(); Removed = @(); Count = 0 }
-    Tasks = @{ Added = @(); Removed = @(); Count = 0 }
-    Users = @{ Added = @(); Removed = @(); Count = 0 }
-    Admins = @{ Added = @(); Removed = @(); Count = 0 }
-    Software = @{ Added = @(); Removed = @(); Count = 0 }
-    Autoruns = @{ Added = @(); Removed = @(); Count = 0 }
-    Shares = @{ Added = @(); Removed = @(); Count = 0 }
+    Processes = @{ Added = @(); Removed = @(); Count = 0; Csv = $null }
+    Services = @{ Added = @(); Removed = @(); Count = 0; Csv = $null }
+    Tasks = @{ Added = @(); Removed = @(); Count = 0; Csv = $null }
+    Users = @{ Added = @(); Removed = @(); Count = 0; Csv = $null }
+    Admins = @{ Added = @(); Removed = @(); Count = 0; Csv = $null }
+    Software = @{ Added = @(); Removed = @(); Count = 0; Csv = $null }
+    Autoruns = @{ Added = @(); Removed = @(); Count = 0; Csv = $null }
+    Shares = @{ Added = @(); Removed = @(); Count = 0; Csv = $null }
     TotalChanges = 0
   }
 
@@ -400,9 +401,40 @@ function Compare-WithBaseline {
       $baseNames = $baseData | Select-Object -ExpandProperty Name -Unique
       $currNames = $currData | Select-Object -ExpandProperty Name -Unique
 
-      $comparison.Processes.Added = @($currNames | Where-Object { $_ -notin $baseNames })
-      $comparison.Processes.Removed = @($baseNames | Where-Object { $_ -notin $currNames })
-      $comparison.Processes.Count = $comparison.Processes.Added.Count + $comparison.Processes.Removed.Count
+      $addedNames = @($currNames | Where-Object { $_ -notin $baseNames })
+      $removedNames = @($baseNames | Where-Object { $_ -notin $currNames })
+
+      $comparison.Processes.Added = $addedNames
+      $comparison.Processes.Removed = $removedNames
+      $comparison.Processes.Count = $addedNames.Count + $removedNames.Count
+
+      # Save comparison CSV
+      if ($comparison.Processes.Count -gt 0) {
+        $comparisonData = @()
+        foreach ($name in $addedNames) {
+          $proc = $currData | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "ADDED"
+            Name = $name
+            Id = $proc.Id
+            Path = $proc.Path
+            CommandLine = $proc.CommandLine
+          }
+        }
+        foreach ($name in $removedNames) {
+          $proc = $baseData | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "REMOVED"
+            Name = $name
+            Id = $proc.Id
+            Path = $proc.Path
+            CommandLine = $proc.CommandLine
+          }
+        }
+        $compCsv = Join-Path $ComparisonCsvDir "comparison_processes.csv"
+        Export-CsvSafe -Data $comparisonData -Path $compCsv
+        $comparison.Processes.Csv = $compCsv
+      }
     }
 
     # Compare Services
@@ -414,9 +446,42 @@ function Compare-WithBaseline {
       $baseNames = $baseData | Select-Object -ExpandProperty Name -Unique
       $currNames = $currData | Select-Object -ExpandProperty Name -Unique
 
-      $comparison.Services.Added = @($currNames | Where-Object { $_ -notin $baseNames })
-      $comparison.Services.Removed = @($baseNames | Where-Object { $_ -notin $currNames })
-      $comparison.Services.Count = $comparison.Services.Added.Count + $comparison.Services.Removed.Count
+      $addedNames = @($currNames | Where-Object { $_ -notin $baseNames })
+      $removedNames = @($baseNames | Where-Object { $_ -notin $currNames })
+
+      $comparison.Services.Added = $addedNames
+      $comparison.Services.Removed = $removedNames
+      $comparison.Services.Count = $addedNames.Count + $removedNames.Count
+
+      # Save comparison CSV
+      if ($comparison.Services.Count -gt 0) {
+        $comparisonData = @()
+        foreach ($name in $addedNames) {
+          $svc = $currData | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "ADDED"
+            Name = $name
+            DisplayName = $svc.DisplayName
+            State = $svc.State
+            StartMode = $svc.StartMode
+            PathName = $svc.PathName
+          }
+        }
+        foreach ($name in $removedNames) {
+          $svc = $baseData | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "REMOVED"
+            Name = $name
+            DisplayName = $svc.DisplayName
+            State = $svc.State
+            StartMode = $svc.StartMode
+            PathName = $svc.PathName
+          }
+        }
+        $compCsv = Join-Path $ComparisonCsvDir "comparison_services.csv"
+        Export-CsvSafe -Data $comparisonData -Path $compCsv
+        $comparison.Services.Csv = $compCsv
+      }
     }
 
     # Compare Scheduled Tasks
@@ -428,9 +493,42 @@ function Compare-WithBaseline {
       $baseNames = $baseData | Select-Object -ExpandProperty TaskName -Unique
       $currNames = $currData | Select-Object -ExpandProperty TaskName -Unique
 
-      $comparison.Tasks.Added = @($currNames | Where-Object { $_ -notin $baseNames })
-      $comparison.Tasks.Removed = @($baseNames | Where-Object { $_ -notin $currNames })
-      $comparison.Tasks.Count = $comparison.Tasks.Added.Count + $comparison.Tasks.Removed.Count
+      $addedNames = @($currNames | Where-Object { $_ -notin $baseNames })
+      $removedNames = @($baseNames | Where-Object { $_ -notin $currNames })
+
+      $comparison.Tasks.Added = $addedNames
+      $comparison.Tasks.Removed = $removedNames
+      $comparison.Tasks.Count = $addedNames.Count + $removedNames.Count
+
+      # Save comparison CSV
+      if ($comparison.Tasks.Count -gt 0) {
+        $comparisonData = @()
+        foreach ($name in $addedNames) {
+          $task = $currData | Where-Object { $_.TaskName -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "ADDED"
+            TaskName = $name
+            TaskPath = $task.TaskPath
+            State = $task.State
+            Author = $task.Author
+            Actions = $task.Actions
+          }
+        }
+        foreach ($name in $removedNames) {
+          $task = $baseData | Where-Object { $_.TaskName -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "REMOVED"
+            TaskName = $name
+            TaskPath = $task.TaskPath
+            State = $task.State
+            Author = $task.Author
+            Actions = $task.Actions
+          }
+        }
+        $compCsv = Join-Path $ComparisonCsvDir "comparison_tasks.csv"
+        Export-CsvSafe -Data $comparisonData -Path $compCsv
+        $comparison.Tasks.Csv = $compCsv
+      }
     }
 
     # Compare Users
@@ -442,9 +540,40 @@ function Compare-WithBaseline {
       $baseNames = $baseData | Select-Object -ExpandProperty Name -Unique
       $currNames = $currData | Select-Object -ExpandProperty Name -Unique
 
-      $comparison.Users.Added = @($currNames | Where-Object { $_ -notin $baseNames })
-      $comparison.Users.Removed = @($baseNames | Where-Object { $_ -notin $currNames })
-      $comparison.Users.Count = $comparison.Users.Added.Count + $comparison.Users.Removed.Count
+      $addedNames = @($currNames | Where-Object { $_ -notin $baseNames })
+      $removedNames = @($baseNames | Where-Object { $_ -notin $currNames })
+
+      $comparison.Users.Added = $addedNames
+      $comparison.Users.Removed = $removedNames
+      $comparison.Users.Count = $addedNames.Count + $removedNames.Count
+
+      # Save comparison CSV
+      if ($comparison.Users.Count -gt 0) {
+        $comparisonData = @()
+        foreach ($name in $addedNames) {
+          $user = $currData | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "ADDED"
+            Name = $name
+            Enabled = $user.Enabled
+            LastLogon = $user.LastLogon
+            Description = $user.Description
+          }
+        }
+        foreach ($name in $removedNames) {
+          $user = $baseData | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "REMOVED"
+            Name = $name
+            Enabled = $user.Enabled
+            LastLogon = $user.LastLogon
+            Description = $user.Description
+          }
+        }
+        $compCsv = Join-Path $ComparisonCsvDir "comparison_users.csv"
+        Export-CsvSafe -Data $comparisonData -Path $compCsv
+        $comparison.Users.Csv = $compCsv
+      }
     }
 
     # Compare Administrators
@@ -456,9 +585,40 @@ function Compare-WithBaseline {
       $baseMembers = $baseData | Select-Object -ExpandProperty Member -Unique
       $currMembers = $currData | Select-Object -ExpandProperty Member -Unique
 
-      $comparison.Admins.Added = @($currMembers | Where-Object { $_ -notin $baseMembers })
-      $comparison.Admins.Removed = @($baseMembers | Where-Object { $_ -notin $currMembers })
-      $comparison.Admins.Count = $comparison.Admins.Added.Count + $comparison.Admins.Removed.Count
+      $addedMembers = @($currMembers | Where-Object { $_ -notin $baseMembers })
+      $removedMembers = @($baseMembers | Where-Object { $_ -notin $currMembers })
+
+      $comparison.Admins.Added = $addedMembers
+      $comparison.Admins.Removed = $removedMembers
+      $comparison.Admins.Count = $addedMembers.Count + $removedMembers.Count
+
+      # Save comparison CSV
+      if ($comparison.Admins.Count -gt 0) {
+        $comparisonData = @()
+        foreach ($member in $addedMembers) {
+          $admin = $currData | Where-Object { $_.Member -eq $member } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "ADDED"
+            Member = $member
+            Group = $admin.Group
+            ObjectClass = $admin.ObjectClass
+            PrincipalSource = $admin.PrincipalSource
+          }
+        }
+        foreach ($member in $removedMembers) {
+          $admin = $baseData | Where-Object { $_.Member -eq $member } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "REMOVED"
+            Member = $member
+            Group = $admin.Group
+            ObjectClass = $admin.ObjectClass
+            PrincipalSource = $admin.PrincipalSource
+          }
+        }
+        $compCsv = Join-Path $ComparisonCsvDir "comparison_administrators.csv"
+        Export-CsvSafe -Data $comparisonData -Path $compCsv
+        $comparison.Admins.Csv = $compCsv
+      }
     }
 
     # Compare Software
@@ -470,9 +630,40 @@ function Compare-WithBaseline {
       $baseNames = $baseData | Select-Object -ExpandProperty DisplayName -Unique
       $currNames = $currData | Select-Object -ExpandProperty DisplayName -Unique
 
-      $comparison.Software.Added = @($currNames | Where-Object { $_ -notin $baseNames })
-      $comparison.Software.Removed = @($baseNames | Where-Object { $_ -notin $currNames })
-      $comparison.Software.Count = $comparison.Software.Added.Count + $comparison.Software.Removed.Count
+      $addedNames = @($currNames | Where-Object { $_ -notin $baseNames })
+      $removedNames = @($baseNames | Where-Object { $_ -notin $currNames })
+
+      $comparison.Software.Added = $addedNames
+      $comparison.Software.Removed = $removedNames
+      $comparison.Software.Count = $addedNames.Count + $removedNames.Count
+
+      # Save comparison CSV
+      if ($comparison.Software.Count -gt 0) {
+        $comparisonData = @()
+        foreach ($name in $addedNames) {
+          $sw = $currData | Where-Object { $_.DisplayName -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "ADDED"
+            DisplayName = $name
+            DisplayVersion = $sw.DisplayVersion
+            Publisher = $sw.Publisher
+            InstallDate = $sw.InstallDate
+          }
+        }
+        foreach ($name in $removedNames) {
+          $sw = $baseData | Where-Object { $_.DisplayName -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "REMOVED"
+            DisplayName = $name
+            DisplayVersion = $sw.DisplayVersion
+            Publisher = $sw.Publisher
+            InstallDate = $sw.InstallDate
+          }
+        }
+        $compCsv = Join-Path $ComparisonCsvDir "comparison_software.csv"
+        Export-CsvSafe -Data $comparisonData -Path $compCsv
+        $comparison.Software.Csv = $compCsv
+      }
     }
 
     # Compare Autoruns
@@ -489,7 +680,37 @@ function Compare-WithBaseline {
 
       $comparison.Autoruns.Added = @($addedItems | ForEach-Object { $_.Split('|')[1] })
       $comparison.Autoruns.Removed = @($removedItems | ForEach-Object { $_.Split('|')[1] })
-      $comparison.Autoruns.Count = $comparison.Autoruns.Added.Count + $comparison.Autoruns.Removed.Count
+      $comparison.Autoruns.Count = $addedItems.Count + $removedItems.Count
+
+      # Save comparison CSV
+      if ($comparison.Autoruns.Count -gt 0) {
+        $comparisonData = @()
+        foreach ($item in $addedItems) {
+          $parts = $item.Split('|')
+          $autorun = $currData | Where-Object { $_.Location -eq $parts[0] -and $_.Name -eq $parts[1] } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "ADDED"
+            Name = $parts[1]
+            Location = $parts[0]
+            Type = $autorun.Type
+            Value = $autorun.Value
+          }
+        }
+        foreach ($item in $removedItems) {
+          $parts = $item.Split('|')
+          $autorun = $baseData | Where-Object { $_.Location -eq $parts[0] -and $_.Name -eq $parts[1] } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "REMOVED"
+            Name = $parts[1]
+            Location = $parts[0]
+            Type = $autorun.Type
+            Value = $autorun.Value
+          }
+        }
+        $compCsv = Join-Path $ComparisonCsvDir "comparison_autoruns.csv"
+        Export-CsvSafe -Data $comparisonData -Path $compCsv
+        $comparison.Autoruns.Csv = $compCsv
+      }
     }
 
     # Compare Shares
@@ -501,9 +722,38 @@ function Compare-WithBaseline {
       $baseNames = $baseData | Select-Object -ExpandProperty Name -Unique
       $currNames = $currData | Select-Object -ExpandProperty Name -Unique
 
-      $comparison.Shares.Added = @($currNames | Where-Object { $_ -notin $baseNames })
-      $comparison.Shares.Removed = @($baseNames | Where-Object { $_ -notin $currNames })
-      $comparison.Shares.Count = $comparison.Shares.Added.Count + $comparison.Shares.Removed.Count
+      $addedNames = @($currNames | Where-Object { $_ -notin $baseNames })
+      $removedNames = @($baseNames | Where-Object { $_ -notin $currNames })
+
+      $comparison.Shares.Added = $addedNames
+      $comparison.Shares.Removed = $removedNames
+      $comparison.Shares.Count = $addedNames.Count + $removedNames.Count
+
+      # Save comparison CSV
+      if ($comparison.Shares.Count -gt 0) {
+        $comparisonData = @()
+        foreach ($name in $addedNames) {
+          $share = $currData | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "ADDED"
+            Name = $name
+            Path = $share.Path
+            Description = $share.Description
+          }
+        }
+        foreach ($name in $removedNames) {
+          $share = $baseData | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "REMOVED"
+            Name = $name
+            Path = $share.Path
+            Description = $share.Description
+          }
+        }
+        $compCsv = Join-Path $ComparisonCsvDir "comparison_shares.csv"
+        Export-CsvSafe -Data $comparisonData -Path $compCsv
+        $comparison.Shares.Csv = $compCsv
+      }
     }
 
     # Calculate total changes
@@ -2086,7 +2336,7 @@ if ($UpdateBaseline) {
   # Compare with existing baseline
   Write-Host ""
   Write-Host "Comparing with baseline at: $baselineDir" -ForegroundColor Cyan
-  $baselineComparison = Compare-WithBaseline -BaselineDir $baselineDir -CurrentInventory $inventory
+  $baselineComparison = Compare-WithBaseline -BaselineDir $baselineDir -CurrentInventory $inventory -ComparisonCsvDir $csvDir
 
   if ($baselineComparison) {
     $inventory.BaselineComparison = $baselineComparison
@@ -2263,56 +2513,64 @@ if ($baselineComparison) {
   if ($baselineComparison.Processes.Count -gt 0) {
     $addedCount = $baselineComparison.Processes.Added.Count
     $removedCount = $baselineComparison.Processes.Removed.Count
-    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Processes Changed</div><div class='metric-value'>$($baselineComparison.Processes.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount</div></div>"
+    $csvLink = if ($baselineComparison.Processes.Csv) { $baselineComparison.Processes.Csv.Replace($reportDir + "\", "") } else { "" }
+    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Processes Changed</div><div class='metric-value'>$($baselineComparison.Processes.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount<br/><a href='$csvLink' style='color: #856404;'>View Details</a></div></div>"
   }
 
   # Services
   if ($baselineComparison.Services.Count -gt 0) {
     $addedCount = $baselineComparison.Services.Added.Count
     $removedCount = $baselineComparison.Services.Removed.Count
-    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Services Changed</div><div class='metric-value'>$($baselineComparison.Services.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount</div></div>"
+    $csvLink = if ($baselineComparison.Services.Csv) { $baselineComparison.Services.Csv.Replace($reportDir + "\", "") } else { "" }
+    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Services Changed</div><div class='metric-value'>$($baselineComparison.Services.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount<br/><a href='$csvLink' style='color: #856404;'>View Details</a></div></div>"
   }
 
   # Scheduled Tasks
   if ($baselineComparison.Tasks.Count -gt 0) {
     $addedCount = $baselineComparison.Tasks.Added.Count
     $removedCount = $baselineComparison.Tasks.Removed.Count
-    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Tasks Changed</div><div class='metric-value'>$($baselineComparison.Tasks.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount</div></div>"
+    $csvLink = if ($baselineComparison.Tasks.Csv) { $baselineComparison.Tasks.Csv.Replace($reportDir + "\", "") } else { "" }
+    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Tasks Changed</div><div class='metric-value'>$($baselineComparison.Tasks.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount<br/><a href='$csvLink' style='color: #856404;'>View Details</a></div></div>"
   }
 
   # Users
   if ($baselineComparison.Users.Count -gt 0) {
     $addedCount = $baselineComparison.Users.Added.Count
     $removedCount = $baselineComparison.Users.Removed.Count
-    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Users Changed</div><div class='metric-value'>$($baselineComparison.Users.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount</div></div>"
+    $csvLink = if ($baselineComparison.Users.Csv) { $baselineComparison.Users.Csv.Replace($reportDir + "\", "") } else { "" }
+    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Users Changed</div><div class='metric-value'>$($baselineComparison.Users.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount<br/><a href='$csvLink' style='color: #856404;'>View Details</a></div></div>"
   }
 
   # Administrators (HIGH PRIORITY)
   if ($baselineComparison.Admins.Count -gt 0) {
     $addedCount = $baselineComparison.Admins.Added.Count
     $removedCount = $baselineComparison.Admins.Removed.Count
-    $changeMetrics += "<div class='metric danger'><div class='metric-label'>ADMINS Changed</div><div class='metric-value'>$($baselineComparison.Admins.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount</div></div>"
+    $csvLink = if ($baselineComparison.Admins.Csv) { $baselineComparison.Admins.Csv.Replace($reportDir + "\", "") } else { "" }
+    $changeMetrics += "<div class='metric danger'><div class='metric-label'>ADMINS Changed</div><div class='metric-value'>$($baselineComparison.Admins.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount<br/><a href='$csvLink' style='color: #721c24;'>View Details</a></div></div>"
   }
 
   # Software
   if ($baselineComparison.Software.Count -gt 0) {
     $addedCount = $baselineComparison.Software.Added.Count
     $removedCount = $baselineComparison.Software.Removed.Count
-    $changeMetrics += "<div class='metric info'><div class='metric-label'>Software Changed</div><div class='metric-value'>$($baselineComparison.Software.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount</div></div>"
+    $csvLink = if ($baselineComparison.Software.Csv) { $baselineComparison.Software.Csv.Replace($reportDir + "\", "") } else { "" }
+    $changeMetrics += "<div class='metric info'><div class='metric-label'>Software Changed</div><div class='metric-value'>$($baselineComparison.Software.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount<br/><a href='$csvLink' style='color: #0c5460;'>View Details</a></div></div>"
   }
 
   # Autoruns
   if ($baselineComparison.Autoruns.Count -gt 0) {
     $addedCount = $baselineComparison.Autoruns.Added.Count
     $removedCount = $baselineComparison.Autoruns.Removed.Count
-    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Autoruns Changed</div><div class='metric-value'>$($baselineComparison.Autoruns.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount</div></div>"
+    $csvLink = if ($baselineComparison.Autoruns.Csv) { $baselineComparison.Autoruns.Csv.Replace($reportDir + "\", "") } else { "" }
+    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Autoruns Changed</div><div class='metric-value'>$($baselineComparison.Autoruns.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount<br/><a href='$csvLink' style='color: #856404;'>View Details</a></div></div>"
   }
 
   # Shares
   if ($baselineComparison.Shares.Count -gt 0) {
     $addedCount = $baselineComparison.Shares.Added.Count
     $removedCount = $baselineComparison.Shares.Removed.Count
-    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Shares Changed</div><div class='metric-value'>$($baselineComparison.Shares.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount</div></div>"
+    $csvLink = if ($baselineComparison.Shares.Csv) { $baselineComparison.Shares.Csv.Replace($reportDir + "\", "") } else { "" }
+    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Shares Changed</div><div class='metric-value'>$($baselineComparison.Shares.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount<br/><a href='$csvLink' style='color: #856404;'>View Details</a></div></div>"
   }
 
   $statusText = if ($totalChanges -eq 0) {
@@ -2573,30 +2831,119 @@ if ($baselineComparison) {
 
     if ($baselineComparison.Processes.Count -gt 0) {
       Write-Host "  [i] Processes Changed: $($baselineComparison.Processes.Count) (+$($baselineComparison.Processes.Added.Count) / -$($baselineComparison.Processes.Removed.Count))" -ForegroundColor Yellow
+      if ($baselineComparison.Processes.Added.Count -gt 0) {
+        $topItems = $baselineComparison.Processes.Added | Select-Object -First 5
+        foreach ($item in $topItems) { Write-Host "      + $item" -ForegroundColor Green }
+        if ($baselineComparison.Processes.Added.Count -gt 5) {
+          Write-Host "      ... and $($baselineComparison.Processes.Added.Count - 5) more" -ForegroundColor DarkGray
+        }
+      }
+      if ($baselineComparison.Processes.Removed.Count -gt 0) {
+        $topItems = $baselineComparison.Processes.Removed | Select-Object -First 3
+        foreach ($item in $topItems) { Write-Host "      - $item" -ForegroundColor Red }
+        if ($baselineComparison.Processes.Removed.Count -gt 3) {
+          Write-Host "      ... and $($baselineComparison.Processes.Removed.Count - 3) more" -ForegroundColor DarkGray
+        }
+      }
+      Write-Host "      See: $($baselineComparison.Processes.Csv)" -ForegroundColor Cyan
     }
 
     if ($baselineComparison.Services.Count -gt 0) {
       Write-Host "  [i] Services Changed: $($baselineComparison.Services.Count) (+$($baselineComparison.Services.Added.Count) / -$($baselineComparison.Services.Removed.Count))" -ForegroundColor Yellow
+      if ($baselineComparison.Services.Added.Count -gt 0) {
+        $topItems = $baselineComparison.Services.Added | Select-Object -First 5
+        foreach ($item in $topItems) { Write-Host "      + $item" -ForegroundColor Green }
+        if ($baselineComparison.Services.Added.Count -gt 5) {
+          Write-Host "      ... and $($baselineComparison.Services.Added.Count - 5) more" -ForegroundColor DarkGray
+        }
+      }
+      if ($baselineComparison.Services.Removed.Count -gt 0) {
+        $topItems = $baselineComparison.Services.Removed | Select-Object -First 3
+        foreach ($item in $topItems) { Write-Host "      - $item" -ForegroundColor Red }
+        if ($baselineComparison.Services.Removed.Count -gt 3) {
+          Write-Host "      ... and $($baselineComparison.Services.Removed.Count - 3) more" -ForegroundColor DarkGray
+        }
+      }
+      Write-Host "      See: $($baselineComparison.Services.Csv)" -ForegroundColor Cyan
     }
 
     if ($baselineComparison.Tasks.Count -gt 0) {
       Write-Host "  [i] Tasks Changed: $($baselineComparison.Tasks.Count) (+$($baselineComparison.Tasks.Added.Count) / -$($baselineComparison.Tasks.Removed.Count))" -ForegroundColor Yellow
+      if ($baselineComparison.Tasks.Added.Count -gt 0) {
+        $topItems = $baselineComparison.Tasks.Added | Select-Object -First 5
+        foreach ($item in $topItems) { Write-Host "      + $item" -ForegroundColor Green }
+        if ($baselineComparison.Tasks.Added.Count -gt 5) {
+          Write-Host "      ... and $($baselineComparison.Tasks.Added.Count - 5) more" -ForegroundColor DarkGray
+        }
+      }
+      if ($baselineComparison.Tasks.Removed.Count -gt 0) {
+        $topItems = $baselineComparison.Tasks.Removed | Select-Object -First 3
+        foreach ($item in $topItems) { Write-Host "      - $item" -ForegroundColor Red }
+        if ($baselineComparison.Tasks.Removed.Count -gt 3) {
+          Write-Host "      ... and $($baselineComparison.Tasks.Removed.Count - 3) more" -ForegroundColor DarkGray
+        }
+      }
+      Write-Host "      See: $($baselineComparison.Tasks.Csv)" -ForegroundColor Cyan
     }
 
     if ($baselineComparison.Users.Count -gt 0) {
       Write-Host "  [i] Users Changed: $($baselineComparison.Users.Count) (+$($baselineComparison.Users.Added.Count) / -$($baselineComparison.Users.Removed.Count))" -ForegroundColor Yellow
+      if ($baselineComparison.Users.Added.Count -gt 0) {
+        foreach ($item in $baselineComparison.Users.Added) { Write-Host "      + $item" -ForegroundColor Green }
+      }
+      if ($baselineComparison.Users.Removed.Count -gt 0) {
+        foreach ($item in $baselineComparison.Users.Removed) { Write-Host "      - $item" -ForegroundColor Red }
+      }
+      Write-Host "      See: $($baselineComparison.Users.Csv)" -ForegroundColor Cyan
     }
 
     if ($baselineComparison.Autoruns.Count -gt 0) {
       Write-Host "  [i] Autoruns Changed: $($baselineComparison.Autoruns.Count) (+$($baselineComparison.Autoruns.Added.Count) / -$($baselineComparison.Autoruns.Removed.Count))" -ForegroundColor Yellow
+      if ($baselineComparison.Autoruns.Added.Count -gt 0) {
+        $topItems = $baselineComparison.Autoruns.Added | Select-Object -First 5
+        foreach ($item in $topItems) { Write-Host "      + $item" -ForegroundColor Green }
+        if ($baselineComparison.Autoruns.Added.Count -gt 5) {
+          Write-Host "      ... and $($baselineComparison.Autoruns.Added.Count - 5) more" -ForegroundColor DarkGray
+        }
+      }
+      if ($baselineComparison.Autoruns.Removed.Count -gt 0) {
+        $topItems = $baselineComparison.Autoruns.Removed | Select-Object -First 3
+        foreach ($item in $topItems) { Write-Host "      - $item" -ForegroundColor Red }
+        if ($baselineComparison.Autoruns.Removed.Count -gt 3) {
+          Write-Host "      ... and $($baselineComparison.Autoruns.Removed.Count - 3) more" -ForegroundColor DarkGray
+        }
+      }
+      Write-Host "      See: $($baselineComparison.Autoruns.Csv)" -ForegroundColor Cyan
     }
 
     if ($baselineComparison.Shares.Count -gt 0) {
       Write-Host "  [i] Shares Changed: $($baselineComparison.Shares.Count) (+$($baselineComparison.Shares.Added.Count) / -$($baselineComparison.Shares.Removed.Count))" -ForegroundColor Yellow
+      if ($baselineComparison.Shares.Added.Count -gt 0) {
+        foreach ($item in $baselineComparison.Shares.Added) { Write-Host "      + $item" -ForegroundColor Green }
+      }
+      if ($baselineComparison.Shares.Removed.Count -gt 0) {
+        foreach ($item in $baselineComparison.Shares.Removed) { Write-Host "      - $item" -ForegroundColor Red }
+      }
+      Write-Host "      See: $($baselineComparison.Shares.Csv)" -ForegroundColor Cyan
     }
 
     if ($baselineComparison.Software.Count -gt 0) {
       Write-Host "  [i] Software Changed: $($baselineComparison.Software.Count) (+$($baselineComparison.Software.Added.Count) / -$($baselineComparison.Software.Removed.Count))" -ForegroundColor Cyan
+      if ($baselineComparison.Software.Added.Count -gt 0) {
+        $topItems = $baselineComparison.Software.Added | Select-Object -First 5
+        foreach ($item in $topItems) { Write-Host "      + $item" -ForegroundColor Green }
+        if ($baselineComparison.Software.Added.Count -gt 5) {
+          Write-Host "      ... and $($baselineComparison.Software.Added.Count - 5) more" -ForegroundColor DarkGray
+        }
+      }
+      if ($baselineComparison.Software.Removed.Count -gt 0) {
+        $topItems = $baselineComparison.Software.Removed | Select-Object -First 3
+        foreach ($item in $topItems) { Write-Host "      - $item" -ForegroundColor Red }
+        if ($baselineComparison.Software.Removed.Count -gt 3) {
+          Write-Host "      ... and $($baselineComparison.Software.Removed.Count - 3) more" -ForegroundColor DarkGray
+        }
+      }
+      Write-Host "      See: $($baselineComparison.Software.Csv)" -ForegroundColor Cyan
     }
   }
 }
