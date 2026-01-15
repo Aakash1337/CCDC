@@ -38,11 +38,26 @@
 .PARAMETER NoProgress
   Disable progress indicators (useful for scripted/automated runs).
 
+.PARAMETER UpdateBaseline
+  Force update/create baseline with current inventory. Use after system hardening or to refresh baseline.
+
+.PARAMETER BaselinePath
+  Custom baseline directory location (default: .\baseline in script directory).
+
+.PARAMETER SkipComparison
+  Skip baseline comparison even if baseline exists. Use for quick inventory without diff.
+
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\Get-WindowsInventory.ps1
 
 .EXAMPLE
   .\Get-WindowsInventory.ps1 -OutputRoot C:\IR -IncludeEventLogs -Quick -Compress
+
+.EXAMPLE
+  .\Get-WindowsInventory.ps1 -UpdateBaseline
+
+.EXAMPLE
+  .\Get-WindowsInventory.ps1 -BaselinePath "D:\SecureBaseline"
 
 .NOTES
   Run as Administrator for best coverage (SecurityCenter2, some registry keys, firewall rules, etc.).
@@ -59,7 +74,10 @@ param(
   [bool]$Firewall = $true,
   [bool]$Certs = $true,
   [switch]$Compress,
-  [switch]$NoProgress
+  [switch]$NoProgress,
+  [switch]$UpdateBaseline,
+  [string]$BaselinePath = "",
+  [switch]$SkipComparison
 )
 
 Set-StrictMode -Version Latest
@@ -269,6 +287,239 @@ function Compress-ReportFolder {
   }
   
   return $null
+}
+
+# ---------------------------- Baseline Management Functions ----------------------------
+
+function Get-BaselineDirectory {
+  param([string]$CustomPath)
+
+  if ($CustomPath) {
+    return $CustomPath
+  }
+
+  $scriptDir = Split-Path -Parent $MyInvocation.ScriptName
+  if (-not $scriptDir) {
+    $scriptDir = Get-Location
+  }
+
+  return Join-Path $scriptDir "baseline"
+}
+
+function Test-BaselineExists {
+  param([string]$BaselineDir)
+
+  $metadataPath = Join-Path $BaselineDir "baseline_metadata.json"
+  return (Test-Path $metadataPath)
+}
+
+function Save-Baseline {
+  param(
+    [Parameter(Mandatory)][string]$BaselineDir,
+    [Parameter(Mandatory)][hashtable]$Inventory
+  )
+
+  try {
+    # Create baseline directory if it doesn't exist
+    if (-not (Test-Path $BaselineDir)) {
+      New-Item -ItemType Directory -Path $BaselineDir -Force | Out-Null
+    }
+
+    Write-LogEntry "Saving baseline to $BaselineDir"
+
+    # Save metadata
+    $metadata = @{
+      CreatedAt = (Get-Date).ToString("o")
+      ComputerName = $env:COMPUTERNAME
+      Version = "2.1-CCDC"
+    }
+    $metadataPath = Join-Path $BaselineDir "baseline_metadata.json"
+    ($metadata | ConvertTo-Json) | Out-File -FilePath $metadataPath -Encoding UTF8 -Force
+
+    # Copy CSV files to baseline
+    $csvMappings = @{
+      "baseline_processes.csv" = $Inventory.Processes.Csv
+      "baseline_services.csv" = $Inventory.Services.Csv
+      "baseline_tasks.csv" = $Inventory.Tasks.Csv
+      "baseline_users.csv" = $Inventory.Users.UsersCsv
+      "baseline_group_members.csv" = $Inventory.Users.MembersCsv
+      "baseline_software.csv" = $Inventory.Software.UninstallCsv
+      "baseline_autoruns.csv" = $Inventory.Autoruns.Csv
+      "baseline_connections.csv" = $Inventory.EstablishedConnections.Csv
+      "baseline_patches.csv" = $Inventory.Patches.Csv
+      "baseline_shares.csv" = $Inventory.Shares.Csv
+    }
+
+    foreach ($baseline in $csvMappings.Keys) {
+      $sourcePath = $csvMappings[$baseline]
+      if ($sourcePath -and (Test-Path $sourcePath)) {
+        $destPath = Join-Path $BaselineDir $baseline
+        Copy-Item -Path $sourcePath -Destination $destPath -Force
+      }
+    }
+
+    Write-LogEntry "Baseline saved successfully" -Level "SUCCESS"
+    return $true
+  } catch {
+    Write-LogEntry "Failed to save baseline: $_" -Level "ERROR"
+    Add-ErrorEntry -Function "Save-Baseline" -Error $_.Exception.Message
+    return $false
+  }
+}
+
+function Compare-WithBaseline {
+  param(
+    [Parameter(Mandatory)][string]$BaselineDir,
+    [Parameter(Mandatory)][hashtable]$CurrentInventory
+  )
+
+  $comparison = @{
+    Processes = @{ Added = @(); Removed = @(); Count = 0 }
+    Services = @{ Added = @(); Removed = @(); Count = 0 }
+    Tasks = @{ Added = @(); Removed = @(); Count = 0 }
+    Users = @{ Added = @(); Removed = @(); Count = 0 }
+    Admins = @{ Added = @(); Removed = @(); Count = 0 }
+    Software = @{ Added = @(); Removed = @(); Count = 0 }
+    Autoruns = @{ Added = @(); Removed = @(); Count = 0 }
+    Shares = @{ Added = @(); Removed = @(); Count = 0 }
+    TotalChanges = 0
+  }
+
+  try {
+    # Load baseline metadata
+    $metadataPath = Join-Path $BaselineDir "baseline_metadata.json"
+    $metadata = Get-Content $metadataPath -Raw | ConvertFrom-Json
+    $comparison.BaselineDate = $metadata.CreatedAt
+
+    # Compare Processes
+    $baselineProc = Join-Path $BaselineDir "baseline_processes.csv"
+    if ((Test-Path $baselineProc) -and $CurrentInventory.Processes.Csv -and (Test-Path $CurrentInventory.Processes.Csv)) {
+      $baseData = Import-Csv $baselineProc
+      $currData = Import-Csv $CurrentInventory.Processes.Csv
+
+      $baseNames = $baseData | Select-Object -ExpandProperty Name -Unique
+      $currNames = $currData | Select-Object -ExpandProperty Name -Unique
+
+      $comparison.Processes.Added = @($currNames | Where-Object { $_ -notin $baseNames })
+      $comparison.Processes.Removed = @($baseNames | Where-Object { $_ -notin $currNames })
+      $comparison.Processes.Count = $comparison.Processes.Added.Count + $comparison.Processes.Removed.Count
+    }
+
+    # Compare Services
+    $baselineSvc = Join-Path $BaselineDir "baseline_services.csv"
+    if ((Test-Path $baselineSvc) -and $CurrentInventory.Services.Csv -and (Test-Path $CurrentInventory.Services.Csv)) {
+      $baseData = Import-Csv $baselineSvc
+      $currData = Import-Csv $CurrentInventory.Services.Csv
+
+      $baseNames = $baseData | Select-Object -ExpandProperty Name -Unique
+      $currNames = $currData | Select-Object -ExpandProperty Name -Unique
+
+      $comparison.Services.Added = @($currNames | Where-Object { $_ -notin $baseNames })
+      $comparison.Services.Removed = @($baseNames | Where-Object { $_ -notin $currNames })
+      $comparison.Services.Count = $comparison.Services.Added.Count + $comparison.Services.Removed.Count
+    }
+
+    # Compare Scheduled Tasks
+    $baselineTask = Join-Path $BaselineDir "baseline_tasks.csv"
+    if ((Test-Path $baselineTask) -and $CurrentInventory.Tasks.Csv -and (Test-Path $CurrentInventory.Tasks.Csv)) {
+      $baseData = Import-Csv $baselineTask
+      $currData = Import-Csv $CurrentInventory.Tasks.Csv
+
+      $baseNames = $baseData | Select-Object -ExpandProperty TaskName -Unique
+      $currNames = $currData | Select-Object -ExpandProperty TaskName -Unique
+
+      $comparison.Tasks.Added = @($currNames | Where-Object { $_ -notin $baseNames })
+      $comparison.Tasks.Removed = @($baseNames | Where-Object { $_ -notin $currNames })
+      $comparison.Tasks.Count = $comparison.Tasks.Added.Count + $comparison.Tasks.Removed.Count
+    }
+
+    # Compare Users
+    $baselineUsers = Join-Path $BaselineDir "baseline_users.csv"
+    if ((Test-Path $baselineUsers) -and $CurrentInventory.Users.UsersCsv -and (Test-Path $CurrentInventory.Users.UsersCsv)) {
+      $baseData = Import-Csv $baselineUsers
+      $currData = Import-Csv $CurrentInventory.Users.UsersCsv
+
+      $baseNames = $baseData | Select-Object -ExpandProperty Name -Unique
+      $currNames = $currData | Select-Object -ExpandProperty Name -Unique
+
+      $comparison.Users.Added = @($currNames | Where-Object { $_ -notin $baseNames })
+      $comparison.Users.Removed = @($baseNames | Where-Object { $_ -notin $currNames })
+      $comparison.Users.Count = $comparison.Users.Added.Count + $comparison.Users.Removed.Count
+    }
+
+    # Compare Administrators
+    $baselineAdmins = Join-Path $BaselineDir "baseline_group_members.csv"
+    if ((Test-Path $baselineAdmins) -and $CurrentInventory.Users.MembersCsv -and (Test-Path $CurrentInventory.Users.MembersCsv)) {
+      $baseData = Import-Csv $baselineAdmins | Where-Object { $_.Group -match 'Administrators' }
+      $currData = Import-Csv $CurrentInventory.Users.MembersCsv | Where-Object { $_.Group -match 'Administrators' }
+
+      $baseMembers = $baseData | Select-Object -ExpandProperty Member -Unique
+      $currMembers = $currData | Select-Object -ExpandProperty Member -Unique
+
+      $comparison.Admins.Added = @($currMembers | Where-Object { $_ -notin $baseMembers })
+      $comparison.Admins.Removed = @($baseMembers | Where-Object { $_ -notin $currMembers })
+      $comparison.Admins.Count = $comparison.Admins.Added.Count + $comparison.Admins.Removed.Count
+    }
+
+    # Compare Software
+    $baselineSoft = Join-Path $BaselineDir "baseline_software.csv"
+    if ((Test-Path $baselineSoft) -and $CurrentInventory.Software.UninstallCsv -and (Test-Path $CurrentInventory.Software.UninstallCsv)) {
+      $baseData = Import-Csv $baselineSoft
+      $currData = Import-Csv $CurrentInventory.Software.UninstallCsv
+
+      $baseNames = $baseData | Select-Object -ExpandProperty DisplayName -Unique
+      $currNames = $currData | Select-Object -ExpandProperty DisplayName -Unique
+
+      $comparison.Software.Added = @($currNames | Where-Object { $_ -notin $baseNames })
+      $comparison.Software.Removed = @($baseNames | Where-Object { $_ -notin $currNames })
+      $comparison.Software.Count = $comparison.Software.Added.Count + $comparison.Software.Removed.Count
+    }
+
+    # Compare Autoruns
+    $baselineAuto = Join-Path $BaselineDir "baseline_autoruns.csv"
+    if ((Test-Path $baselineAuto) -and $CurrentInventory.Autoruns.Csv -and (Test-Path $CurrentInventory.Autoruns.Csv)) {
+      $baseData = Import-Csv $baselineAuto
+      $currData = Import-Csv $CurrentInventory.Autoruns.Csv
+
+      $baseItems = $baseData | ForEach-Object { "$($_.Location)|$($_.Name)" }
+      $currItems = $currData | ForEach-Object { "$($_.Location)|$($_.Name)" }
+
+      $addedItems = @($currItems | Where-Object { $_ -notin $baseItems })
+      $removedItems = @($baseItems | Where-Object { $_ -notin $currItems })
+
+      $comparison.Autoruns.Added = @($addedItems | ForEach-Object { $_.Split('|')[1] })
+      $comparison.Autoruns.Removed = @($removedItems | ForEach-Object { $_.Split('|')[1] })
+      $comparison.Autoruns.Count = $comparison.Autoruns.Added.Count + $comparison.Autoruns.Removed.Count
+    }
+
+    # Compare Shares
+    $baselineShares = Join-Path $BaselineDir "baseline_shares.csv"
+    if ((Test-Path $baselineShares) -and $CurrentInventory.Shares.Csv -and (Test-Path $CurrentInventory.Shares.Csv)) {
+      $baseData = Import-Csv $baselineShares
+      $currData = Import-Csv $CurrentInventory.Shares.Csv
+
+      $baseNames = $baseData | Select-Object -ExpandProperty Name -Unique
+      $currNames = $currData | Select-Object -ExpandProperty Name -Unique
+
+      $comparison.Shares.Added = @($currNames | Where-Object { $_ -notin $baseNames })
+      $comparison.Shares.Removed = @($baseNames | Where-Object { $_ -notin $currNames })
+      $comparison.Shares.Count = $comparison.Shares.Added.Count + $comparison.Shares.Removed.Count
+    }
+
+    # Calculate total changes
+    $comparison.TotalChanges = $comparison.Processes.Count + $comparison.Services.Count +
+                               $comparison.Tasks.Count + $comparison.Users.Count +
+                               $comparison.Admins.Count + $comparison.Software.Count +
+                               $comparison.Autoruns.Count + $comparison.Shares.Count
+
+    Write-LogEntry "Baseline comparison complete: $($comparison.TotalChanges) total changes detected"
+
+    return $comparison
+  } catch {
+    Write-LogEntry "Failed to compare with baseline: $_" -Level "ERROR"
+    Add-ErrorEntry -Function "Compare-WithBaseline" -Error $_.Exception.Message
+    return $null
+  }
 }
 
 # ---------------------------- CCDC Threat Detection Functions ----------------------------
@@ -1816,6 +2067,49 @@ if ($script:ErrorLog.Count -gt 0) {
   Write-LogEntry "Encountered $($script:ErrorLog.Count) errors during collection" -Level "WARN"
 }
 
+# ---------------------------- Baseline Management ----------------------------
+
+$baselineDir = Get-BaselineDirectory -CustomPath $BaselinePath
+$baselineExists = Test-BaselineExists -BaselineDir $baselineDir
+$baselineComparison = $null
+
+if ($UpdateBaseline) {
+  # Force update baseline
+  Write-Host ""
+  Write-Host "Updating baseline at: $baselineDir" -ForegroundColor Cyan
+  $saved = Save-Baseline -BaselineDir $baselineDir -Inventory $inventory
+  if ($saved) {
+    Write-Host "Baseline updated successfully" -ForegroundColor Green
+    Write-Host ""
+  }
+} elseif ($baselineExists -and -not $SkipComparison) {
+  # Compare with existing baseline
+  Write-Host ""
+  Write-Host "Comparing with baseline at: $baselineDir" -ForegroundColor Cyan
+  $baselineComparison = Compare-WithBaseline -BaselineDir $baselineDir -CurrentInventory $inventory
+
+  if ($baselineComparison) {
+    $inventory.BaselineComparison = $baselineComparison
+
+    # Log comparison results
+    if ($baselineComparison.TotalChanges -gt 0) {
+      Write-LogEntry "Baseline comparison: $($baselineComparison.TotalChanges) changes detected since baseline" -Level "WARN"
+    } else {
+      Write-LogEntry "Baseline comparison: No changes detected" -Level "SUCCESS"
+    }
+  }
+} elseif (-not $baselineExists -and -not $SkipComparison) {
+  # No baseline exists - create one automatically
+  Write-Host ""
+  Write-Host "No baseline found - creating new baseline at: $baselineDir" -ForegroundColor Yellow
+  $saved = Save-Baseline -BaselineDir $baselineDir -Inventory $inventory
+  if ($saved) {
+    Write-Host "Baseline created successfully" -ForegroundColor Green
+    Write-Host "Future runs will compare against this baseline" -ForegroundColor Cyan
+    Write-Host ""
+  }
+}
+
 # Write JSON report
 Write-LogEntry "Writing JSON summary"
 $jsonPath = Join-Path $reportDir "inventory.json"
@@ -1955,6 +2249,81 @@ if ($totalThreats -gt 0 -or $criticalWeaknesses -gt 0) {
   $threatSummary = "<div class='section $threatClass'><h2>[!] CCDC THREAT ANALYSIS - IMMEDIATE ATTENTION REQUIRED</h2><div style='font-size: 1.2em; margin: 15px 0;'><strong>Total Suspicious Items: $totalThreats</strong> | <strong>Critical Security Issues: $criticalWeaknesses</strong></div><div style='display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-top: 20px;'>$threatMetrics</div><div style='margin-top: 20px; padding: 15px; background: rgba(255,255,255,0.3); border-radius: 5px;'><strong>Next Steps:</strong><ol style='margin: 10px 0;'><li>Review all suspicious items in the CSV files linked above</li><li>Investigate processes, services, and tasks running from unusual locations</li><li>Verify all network connections, especially to uncommon ports</li><li>Check unauthorized administrators and remove if needed</li><li>Address critical security weaknesses immediately (Defender, Firewall, UAC)</li><li>Review recent system file modifications for unauthorized changes</li></ol></div></div>"
 }
 
+# Generate baseline comparison section
+$baselineSection = ""
+if ($baselineComparison) {
+  $baselineDate = try { ([datetime]$baselineComparison.BaselineDate).ToString("yyyy-MM-dd HH:mm") } catch { "Unknown" }
+  $totalChanges = $baselineComparison.TotalChanges
+
+  $changeClass = if ($baselineComparison.Admins.Count -gt 0) { "danger" } elseif ($totalChanges -gt 10) { "warning" } elseif ($totalChanges -gt 0) { "info" } else { "success" }
+
+  $changeMetrics = ""
+
+  # Processes
+  if ($baselineComparison.Processes.Count -gt 0) {
+    $addedCount = $baselineComparison.Processes.Added.Count
+    $removedCount = $baselineComparison.Processes.Removed.Count
+    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Processes Changed</div><div class='metric-value'>$($baselineComparison.Processes.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount</div></div>"
+  }
+
+  # Services
+  if ($baselineComparison.Services.Count -gt 0) {
+    $addedCount = $baselineComparison.Services.Added.Count
+    $removedCount = $baselineComparison.Services.Removed.Count
+    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Services Changed</div><div class='metric-value'>$($baselineComparison.Services.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount</div></div>"
+  }
+
+  # Scheduled Tasks
+  if ($baselineComparison.Tasks.Count -gt 0) {
+    $addedCount = $baselineComparison.Tasks.Added.Count
+    $removedCount = $baselineComparison.Tasks.Removed.Count
+    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Tasks Changed</div><div class='metric-value'>$($baselineComparison.Tasks.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount</div></div>"
+  }
+
+  # Users
+  if ($baselineComparison.Users.Count -gt 0) {
+    $addedCount = $baselineComparison.Users.Added.Count
+    $removedCount = $baselineComparison.Users.Removed.Count
+    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Users Changed</div><div class='metric-value'>$($baselineComparison.Users.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount</div></div>"
+  }
+
+  # Administrators (HIGH PRIORITY)
+  if ($baselineComparison.Admins.Count -gt 0) {
+    $addedCount = $baselineComparison.Admins.Added.Count
+    $removedCount = $baselineComparison.Admins.Removed.Count
+    $changeMetrics += "<div class='metric danger'><div class='metric-label'>ADMINS Changed</div><div class='metric-value'>$($baselineComparison.Admins.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount</div></div>"
+  }
+
+  # Software
+  if ($baselineComparison.Software.Count -gt 0) {
+    $addedCount = $baselineComparison.Software.Added.Count
+    $removedCount = $baselineComparison.Software.Removed.Count
+    $changeMetrics += "<div class='metric info'><div class='metric-label'>Software Changed</div><div class='metric-value'>$($baselineComparison.Software.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount</div></div>"
+  }
+
+  # Autoruns
+  if ($baselineComparison.Autoruns.Count -gt 0) {
+    $addedCount = $baselineComparison.Autoruns.Added.Count
+    $removedCount = $baselineComparison.Autoruns.Removed.Count
+    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Autoruns Changed</div><div class='metric-value'>$($baselineComparison.Autoruns.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount</div></div>"
+  }
+
+  # Shares
+  if ($baselineComparison.Shares.Count -gt 0) {
+    $addedCount = $baselineComparison.Shares.Added.Count
+    $removedCount = $baselineComparison.Shares.Removed.Count
+    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Shares Changed</div><div class='metric-value'>$($baselineComparison.Shares.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount</div></div>"
+  }
+
+  $statusText = if ($totalChanges -eq 0) {
+    "<div style='font-size: 1.2em; margin: 15px 0; color: #28a745;'><strong>[OK] No changes detected since baseline</strong></div>"
+  } else {
+    "<div style='font-size: 1.2em; margin: 15px 0;'><strong>Total Changes: $totalChanges</strong></div>"
+  }
+
+  $baselineSection = "<div class='section $changeClass'><h2>BASELINE COMPARISON (since $baselineDate)</h2>$statusText<div style='display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-top: 20px;'>$changeMetrics</div></div>"
+}
+
 # Ensure $sys and $sec are valid with default properties
 if (-not $sys) {
   $sys = [pscustomobject]@{
@@ -2039,6 +2408,7 @@ $htmlContent += "<div class='header'><h1>Windows Inventory Report - CCDC Edition
 $htmlContent += "<p><b>Computer:</b> $($sys.ComputerName) | <b>Collected:</b> $($inventory.Metadata.CollectedAt)</p>"
 $htmlContent += "<p><b>Duration:</b> $($inventory.Metadata.ExecutionTime.DurationSeconds)s | <b>Quick Mode:</b> $($inventory.Metadata.QuickMode)</p></div>"
 $htmlContent += $errorSection
+$htmlContent += $baselineSection
 $htmlContent += $threatSummary
 $htmlContent += "<div class='section'><h2>Summary Metrics</h2>$summaryMetrics</div>"
 $htmlContent += "<div class='section'><h2>System Details</h2>$summaryHtml</div>"
@@ -2175,6 +2545,60 @@ if ($inventory.ThreatAnalysis.SecurityWeaknesses.Count -gt 0) {
 if ($inventory.ThreatAnalysis.RecentModifications.Count -gt 0) {
   Write-Host ""
   Write-Host "[i] $($inventory.ThreatAnalysis.RecentModifications.Count) recent system file modifications (last 24h)" -ForegroundColor Cyan
+}
+
+# Baseline comparison summary
+if ($baselineComparison) {
+  Write-Host ""
+  Write-Host "========================================" -ForegroundColor Cyan
+  Write-Host "  BASELINE COMPARISON" -ForegroundColor Cyan
+  Write-Host "========================================" -ForegroundColor Cyan
+  Write-Host ""
+
+  if ($baselineComparison.TotalChanges -eq 0) {
+    Write-Host "[OK] No changes detected since baseline" -ForegroundColor Green
+  } else {
+    Write-Host "[!] CHANGES DETECTED: $($baselineComparison.TotalChanges) total changes since baseline" -ForegroundColor Yellow
+    Write-Host ""
+
+    if ($baselineComparison.Admins.Count -gt 0) {
+      Write-Host "  [!] Administrators Changed: $($baselineComparison.Admins.Count)" -ForegroundColor Red
+      if ($baselineComparison.Admins.Added.Count -gt 0) {
+        Write-Host "      Added: $($baselineComparison.Admins.Added -join ', ')" -ForegroundColor Red
+      }
+      if ($baselineComparison.Admins.Removed.Count -gt 0) {
+        Write-Host "      Removed: $($baselineComparison.Admins.Removed -join ', ')" -ForegroundColor Yellow
+      }
+    }
+
+    if ($baselineComparison.Processes.Count -gt 0) {
+      Write-Host "  [i] Processes Changed: $($baselineComparison.Processes.Count) (+$($baselineComparison.Processes.Added.Count) / -$($baselineComparison.Processes.Removed.Count))" -ForegroundColor Yellow
+    }
+
+    if ($baselineComparison.Services.Count -gt 0) {
+      Write-Host "  [i] Services Changed: $($baselineComparison.Services.Count) (+$($baselineComparison.Services.Added.Count) / -$($baselineComparison.Services.Removed.Count))" -ForegroundColor Yellow
+    }
+
+    if ($baselineComparison.Tasks.Count -gt 0) {
+      Write-Host "  [i] Tasks Changed: $($baselineComparison.Tasks.Count) (+$($baselineComparison.Tasks.Added.Count) / -$($baselineComparison.Tasks.Removed.Count))" -ForegroundColor Yellow
+    }
+
+    if ($baselineComparison.Users.Count -gt 0) {
+      Write-Host "  [i] Users Changed: $($baselineComparison.Users.Count) (+$($baselineComparison.Users.Added.Count) / -$($baselineComparison.Users.Removed.Count))" -ForegroundColor Yellow
+    }
+
+    if ($baselineComparison.Autoruns.Count -gt 0) {
+      Write-Host "  [i] Autoruns Changed: $($baselineComparison.Autoruns.Count) (+$($baselineComparison.Autoruns.Added.Count) / -$($baselineComparison.Autoruns.Removed.Count))" -ForegroundColor Yellow
+    }
+
+    if ($baselineComparison.Shares.Count -gt 0) {
+      Write-Host "  [i] Shares Changed: $($baselineComparison.Shares.Count) (+$($baselineComparison.Shares.Added.Count) / -$($baselineComparison.Shares.Removed.Count))" -ForegroundColor Yellow
+    }
+
+    if ($baselineComparison.Software.Count -gt 0) {
+      Write-Host "  [i] Software Changed: $($baselineComparison.Software.Count) (+$($baselineComparison.Software.Added.Count) / -$($baselineComparison.Software.Removed.Count))" -ForegroundColor Cyan
+    }
+  }
 }
 
 Write-Host ""
