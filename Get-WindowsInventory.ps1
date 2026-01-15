@@ -2996,20 +2996,45 @@ if ($inventory.Metadata.ErrorCount -gt 0) {
 # Build JavaScript for interactive features
 $javaScript = @'
 <script>
-// Tab Management
-function switchTab(tabName, element) {
+// Tab Management - Simplified version
+function switchTab(tabName) {
+  console.log('Switching to tab: ' + tabName);
+
   // Hide all tab contents
-  document.querySelectorAll('.tab-content').forEach(tab => tab.classList.remove('active'));
+  var tabs = document.getElementsByClassName('tab-content');
+  for (var i = 0; i < tabs.length; i++) {
+    tabs[i].classList.remove('active');
+  }
+
   // Remove active from all buttons
-  document.querySelectorAll('.tab-nav button').forEach(btn => btn.classList.remove('active'));
+  var buttons = document.querySelectorAll('.tab-nav button');
+  for (var j = 0; j < buttons.length; j++) {
+    buttons[j].classList.remove('active');
+  }
+
   // Show selected tab
   var selectedTab = document.getElementById(tabName);
   if (selectedTab) {
     selectedTab.classList.add('active');
+    console.log('Activated tab: ' + tabName);
+  } else {
+    console.error('Tab not found: ' + tabName);
   }
-  // Mark button as active
-  if (element) {
-    element.classList.add('active');
+
+  // Mark clicked button as active
+  var clickedButton = event ? event.target : null;
+  if (!clickedButton) {
+    // Find button by data attribute
+    var allButtons = document.querySelectorAll('.tab-nav button');
+    for (var k = 0; k < allButtons.length; k++) {
+      if (allButtons[k].getAttribute('data-tab') === tabName) {
+        clickedButton = allButtons[k];
+        break;
+      }
+    }
+  }
+  if (clickedButton) {
+    clickedButton.classList.add('active');
   }
 
   // Lazy load data explorer
@@ -3286,12 +3311,10 @@ window.compareReports = function() {
   });
 };
 
-// Initialize
+// Initialize - Make sure Dashboard is shown on load
 document.addEventListener('DOMContentLoaded', function() {
-  var dashboardBtn = document.querySelector('.tab-nav button');
-  if (dashboardBtn) {
-    switchTab('dashboard', dashboardBtn);
-  }
+  console.log('Page loaded, initializing tabs');
+  switchTab('dashboard');
 });
 </script>
 '@
@@ -3303,10 +3326,10 @@ $htmlContent += "<p><b>Duration:</b> $($inventory.Metadata.ExecutionTime.Duratio
 
 # Tab Navigation
 $htmlContent += "<nav class='tab-nav'><ul>"
-$htmlContent += "<li><button onclick=""switchTab('dashboard', this)"" class='active'>Dashboard</button></li>"
-$htmlContent += "<li><button onclick=""switchTab('baseline-comparison', this)"">Baseline Comparison</button></li>"
-$htmlContent += "<li><button onclick=""switchTab('data-explorer', this)"">Data Explorer</button></li>"
-$htmlContent += "<li><button onclick=""switchTab('report-comparison', this)"">Report Comparison</button></li>"
+$htmlContent += "<li><button onclick=""switchTab('dashboard')"" data-tab='dashboard' class='active'>Dashboard</button></li>"
+$htmlContent += "<li><button onclick=""switchTab('baseline-comparison')"" data-tab='baseline-comparison'>Baseline Comparison</button></li>"
+$htmlContent += "<li><button onclick=""switchTab('data-explorer')"" data-tab='data-explorer'>Data Explorer</button></li>"
+$htmlContent += "<li><button onclick=""switchTab('report-comparison')"" data-tab='report-comparison'>Report Comparison</button></li>"
 $htmlContent += "</ul></nav>"
 
 # Tab 1: Dashboard
