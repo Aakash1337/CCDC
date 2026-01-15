@@ -168,10 +168,10 @@ function Write-TextFile {
 
 function Export-CsvSafe {
   param(
-    [Parameter(Mandatory)][object[]]$Data,
+    [Parameter(Mandatory)]$Data,
     [Parameter(Mandatory)][string]$Path
   )
-  if ($null -eq $Data -or $Data.Count -eq 0) {
+  if ($null -eq $Data -or @($Data).Count -eq 0) {
     "" | Out-File -FilePath $Path -Encoding UTF8 -Force
     return
   }
@@ -904,15 +904,27 @@ function Get-ScheduledTasksInfo {
         $nextRunTime = if ($info) { $info.NextRunTime } else { $null }
         $lastTaskResult = if ($info) { $info.LastTaskResult } else { $null }
 
+        # Safely format actions
+        $actionsText = ""
+        if ($_.Actions) {
+          $actionsText = (($_.Actions | ForEach-Object {
+            try {
+              $exe = if ($_.PSObject.Properties['Execute']) { $_.Execute } else { "" }
+              $args = if ($_.PSObject.Properties['Arguments']) { $_.Arguments } else { "" }
+              if ($exe) { "$exe $args".Trim() } else { $_.ToString() }
+            } catch {
+              $_.ToString()
+            }
+          }) -join "; ")
+        }
+
         [pscustomobject]@{
           TaskName     = $_.TaskName
           TaskPath     = $_.TaskPath
           State        = $_.State
           Author       = $_.Author
           Description  = $_.Description
-          Actions      = (($_.Actions | ForEach-Object {
-            "$($_.Execute) $($_.Arguments)"
-          }) -join "; ")
+          Actions      = $actionsText
           Triggers     = (($_.Triggers | ForEach-Object {
             $_.ToString()
           }) -join "; ")
