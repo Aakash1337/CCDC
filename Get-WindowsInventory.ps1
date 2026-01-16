@@ -2993,7 +2993,7 @@ if ($inventory.Metadata.ErrorCount -gt 0) {
   $errorSection = "<div class='section danger'><h2>[!] Collection Errors ($($inventory.Metadata.ErrorCount))</h2><p>Some data collection operations encountered errors. See <a href='csv/collection_errors.csv'>collection_errors.csv</a> for details.</p></div>"
 }
 
-# Build JavaScript for interactive features - MINIMAL VERSION
+# Build JavaScript for interactive features
 $javaScript = @'
 <script>
 function switchTab(tabName, button) {
@@ -3007,6 +3007,95 @@ function switchTab(tabName, button) {
   }
   document.getElementById(tabName).classList.add('active');
   button.classList.add('active');
+
+  if (tabName === 'data-explorer' && !window.explorerLoaded) {
+    loadDataExplorer();
+    window.explorerLoaded = true;
+  }
+}
+
+function loadDataExplorer() {
+  var fileList = document.getElementById('file-list');
+  var html = '<h4 style="margin-bottom: 10px;">Available Files</h4>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/processes.csv\', \'Processes\')">📊 processes.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/services.csv\', \'Services\')">📊 services.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/scheduled_tasks.csv\', \'Scheduled Tasks\')">📊 scheduled_tasks.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/users.csv\', \'Users\')">📊 users.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/group_members.csv\', \'Group Members\')">📊 group_members.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/software.csv\', \'Software\')">📊 software.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/patches.csv\', \'Patches\')">📊 patches.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/autoruns.csv\', \'Autoruns\')">📊 autoruns.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/network_connections_enhanced.csv\', \'Network Connections\')">📊 network_connections.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/listening_ports.csv\', \'Listening Ports\')">📊 listening_ports.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/shares.csv\', \'Shares\')">📊 shares.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/firewall_rules.csv\', \'Firewall Rules\')">📊 firewall_rules.csv</div>';
+  html += '<div class="file-item" onclick="loadJSON(\'inventory.json\', \'Inventory JSON\')">📄 inventory.json</div>';
+  fileList.innerHTML = html;
+}
+
+function loadCSV(path, name) {
+  var viewer = document.getElementById('file-viewer');
+  viewer.innerHTML = '<div class="loading">Loading ' + name + '...</div>';
+
+  fetch(path)
+    .then(function(response) { return response.text(); })
+    .then(function(text) {
+      var lines = text.split('\n');
+      if (lines.length === 0) {
+        viewer.innerHTML = '<p>No data in file</p>';
+        return;
+      }
+
+      var html = '<h3>' + name + '</h3>';
+      html += '<div style="overflow-x: auto;"><table><thead><tr>';
+
+      var headers = lines[0].split(',');
+      for (var i = 0; i < headers.length; i++) {
+        html += '<th>' + headers[i].replace(/"/g, '') + '</th>';
+      }
+      html += '</tr></thead><tbody>';
+
+      var maxRows = Math.min(lines.length, 101);
+      for (var j = 1; j < maxRows; j++) {
+        if (!lines[j].trim()) continue;
+        html += '<tr>';
+        var cells = lines[j].split(',');
+        for (var k = 0; k < cells.length; k++) {
+          var val = cells[k].replace(/"/g, '');
+          if (val.length > 80) val = val.substring(0, 77) + '...';
+          html += '<td>' + val + '</td>';
+        }
+        html += '</tr>';
+      }
+      html += '</tbody></table></div>';
+      if (lines.length > 101) {
+        html += '<p style="margin-top: 10px; color: #666;">Showing first 100 rows. Download CSV for full data.</p>';
+      }
+      viewer.innerHTML = html;
+    })
+    .catch(function(err) {
+      viewer.innerHTML = '<p style="color: #dc3545;">Error loading file: ' + err.message + '</p>';
+    });
+}
+
+function loadJSON(path, name) {
+  var viewer = document.getElementById('file-viewer');
+  viewer.innerHTML = '<div class="loading">Loading ' + name + '...</div>';
+
+  fetch(path)
+    .then(function(response) { return response.text(); })
+    .then(function(text) {
+      try {
+        var json = JSON.parse(text);
+        var formatted = JSON.stringify(json, null, 2);
+        viewer.innerHTML = '<h3>' + name + '</h3><div class="json-viewer"><pre>' + formatted + '</pre></div>';
+      } catch (e) {
+        viewer.innerHTML = '<p style="color: #dc3545;">Error parsing JSON: ' + e.message + '</p>';
+      }
+    })
+    .catch(function(err) {
+      viewer.innerHTML = '<p style="color: #dc3545;">Error loading file: ' + err.message + '</p>';
+    });
 }
 </script>
 '@
