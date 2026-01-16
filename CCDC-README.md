@@ -1,10 +1,47 @@
-# Get-WindowsInventory.ps1 - CCDC Enhanced Edition v2.1
+# Get-WindowsInventory.ps1 - CCDC Enhanced Edition v2.2
 
 ## 🎯 Overview
 
-This is a **CCDC-ready** Windows system inventory and threat detection script designed specifically for Collegiate Cyber Defense Competition teams. It provides comprehensive system baselining, automated threat detection, and actionable security recommendations.
+This is a **CCDC-ready** Windows system inventory and threat detection script designed specifically for Collegiate Cyber Defense Competition teams. It provides comprehensive system baselining, automated threat detection, integrated baseline comparison, and actionable security recommendations.
 
-## 🆕 CCDC Enhancements (v2.1)
+## 🆕 CCDC Enhancements (v2.2)
+
+### ⭐ NEW: Integrated Baseline Comparison
+
+The script now includes **built-in baseline comparison**! No need for a separate comparison tool:
+
+- **Automatic Workflow**: First run creates baseline, subsequent runs auto-compare
+- **Inline Display**: Changes displayed directly in HTML report with expandable tables
+- **Detailed CSVs**: Full comparison data exported to CSV files
+- **Easy Updates**: Use `-UpdateBaseline` flag to refresh baseline after hardening
+- **Custom Paths**: Support for custom baseline locations with `-BaselinePath`
+
+**What's Compared:**
+- Processes (added/removed)
+- Services (added/removed)
+- Scheduled Tasks (added/removed)
+- Users (added/removed)
+- **Administrators** (added/removed) ⚠️ HIGH PRIORITY
+- Software (added/removed)
+- Autoruns (added/removed)
+- Network Shares (added/removed)
+
+**Baseline Commands:**
+```powershell
+# First run - creates baseline automatically
+.\Get-WindowsInventory.ps1
+
+# Subsequent runs - auto-compares with baseline
+.\Get-WindowsInventory.ps1
+
+# After hardening - update the baseline
+.\Get-WindowsInventory.ps1 -UpdateBaseline
+
+# Custom baseline location
+.\Get-WindowsInventory.ps1 -BaselinePath "C:\CCDC\baseline"
+```
+
+## 🔍 CCDC Enhancements (v2.1)
 
 ### Automated Threat Detection
 
@@ -30,15 +67,20 @@ The script now includes intelligent threat detection for:
 ### Basic Usage (Recommended for Competition)
 
 ```powershell
-# Run with Quick mode for fastest results
+# First run - creates baseline automatically!
 powershell -ExecutionPolicy Bypass -File .\Get-WindowsInventory.ps1 -Quick
 
-# Run with all features (slower but more comprehensive)
-powershell -ExecutionPolicy Bypass -File .\Get-WindowsInventory.ps1
+# Subsequent runs - auto-compares with baseline!
+powershell -ExecutionPolicy Bypass -File .\Get-WindowsInventory.ps1 -Quick
 
 # Run with compression for easy transfer
 powershell -ExecutionPolicy Bypass -File .\Get-WindowsInventory.ps1 -Quick -Compress
+
+# After hardening - update baseline
+powershell -ExecutionPolicy Bypass -File .\Get-WindowsInventory.ps1 -UpdateBaseline
 ```
+
+**💡 Baseline Magic:** The script automatically creates a baseline on first run and compares against it on subsequent runs. No manual diffing needed!
 
 ### Advanced Usage
 
@@ -96,6 +138,7 @@ The diff tool will:
 
 ```powershell
 # Run on all systems as soon as competition starts
+# This automatically creates your baseline!
 .\Get-WindowsInventory.ps1 -Quick -Compress
 ```
 
@@ -104,6 +147,7 @@ The diff tool will:
 2. Open the HTML report (`system_report.html`) and check the "CCDC THREAT ANALYSIS" section
 3. Address any **CRITICAL** security weaknesses immediately (Defender, Firewall, UAC)
 4. Review `threat_suspicious_*.csv` files for immediate threats
+5. **Note**: First run automatically creates `./baseline/` folder
 
 ### 2. Investigate Threats (Next 30 minutes)
 
@@ -117,30 +161,37 @@ Review these files in order of priority:
 6. **`threat_suspicious_tasks.csv`**: Disable or remove malicious scheduled tasks
 7. **`recent_system_modifications_24h.csv`**: Check for backdoored system files
 
-### 3. Establish Baseline
+### 3. System Hardening & Baseline Update
 
-Save your initial inventory:
+After cleaning up threats and hardening:
 ```powershell
-# Archive baseline for later comparison
-Copy-Item Inventory_* C:\CCDC\Baseline\
+# Update baseline to reflect clean, hardened state
+.\Get-WindowsInventory.ps1 -UpdateBaseline
 ```
+
+This refreshes your baseline so future scans compare against the **hardened** system!
 
 ### 4. Periodic Monitoring (Every 30-60 minutes)
 
 ```powershell
-# Re-run to detect new changes
+# Re-run to detect new changes (compares with baseline automatically!)
 .\Get-WindowsInventory.ps1 -Quick
-
-# Compare with baseline using the diff tool
-.\Compare-WindowsInventory.ps1 -BaselinePath C:\CCDC\Baseline\Inventory_* -CurrentPath .\Inventory_*
-
-# Review the diff report
-# Open: InventoryDiff_*/diff_report.html
-# Check: csv/suspicious_changes_summary.csv
 ```
 
-**What to look for in diffs:**
-- New administrator accounts (HIGH PRIORITY)
+**The script automatically:**
+- Compares current state with baseline
+- Shows changes inline in HTML report
+- Exports detailed comparison CSVs
+- Displays top changes in console
+
+**Review in HTML Report:**
+- **"BASELINE COMPARISON"** section shows all changes
+- Click expandable sections to see added/removed items
+- Green = Added, Red = Removed
+- Full details displayed in tables
+
+**What to look for:**
+- New administrator accounts (⚠️ **HIGH PRIORITY**)
 - New auto-start services from suspicious locations
 - New scheduled tasks with encoded commands
 - New network connections to unusual ports
@@ -397,7 +448,7 @@ New-NetFirewallRule -DisplayName "Block-C2" -Direction Outbound -RemoteAddress 1
 
 Use these tools as part of your defense strategy:
 
-- [ ] Run inventory on all systems within first 15 minutes
+- [ ] Run inventory on all systems within first 15 minutes (creates baseline automatically!)
 - [ ] Review threat analysis section immediately
 - [ ] Fix all CRITICAL security weaknesses
 - [ ] Remove unauthorized administrator accounts
@@ -406,11 +457,12 @@ Use these tools as part of your defense strategy:
 - [ ] Block suspicious network connections
 - [ ] Disable suspicious scheduled tasks
 - [ ] Review recent file modifications
-- [ ] Save baseline for comparison
-- [ ] Re-run periodically to detect changes
-- [ ] **Use Compare-WindowsInventory.ps1 to diff snapshots**
-- [ ] Review suspicious changes in diff reports
-- [ ] Investigate and respond to High/Medium risk changes
+- [ ] After threat cleanup, run with `-UpdateBaseline` to reset baseline
+- [ ] Re-run periodically to detect changes (compares automatically!)
+- [ ] Review BASELINE COMPARISON section in HTML report
+- [ ] Check expandable tables for added/removed items
+- [ ] Review comparison CSV files for details
+- [ ] Investigate administrator changes (highest priority!)
 - [ ] Document all findings in incident log
 
 ## ⚡ Performance Tips
@@ -495,6 +547,19 @@ Import-Csv .\csv\security_weaknesses.csv | Where-Object Risk -eq 'Critical'
 
 ## 📝 Version History
 
+### v2.2 (CCDC Enhanced Edition with Integrated Baseline) - 2026-01-16
+**Get-WindowsInventory.ps1:**
+- ⭐ **NEW**: Integrated baseline comparison functionality
+- Automatic baseline creation on first run
+- Automatic comparison on subsequent runs
+- `-UpdateBaseline` flag to refresh baseline after hardening
+- `-BaselinePath` parameter for custom baseline locations
+- `-SkipComparison` flag to disable comparison
+- Inline HTML display of baseline changes with expandable tables
+- Detailed comparison CSV exports for all categories
+- Console output showing top changed items
+- Compares: processes, services, tasks, users, admins, software, autoruns, shares
+
 ### v2.1 (CCDC Enhanced Edition) - 2025-01-15
 **Get-WindowsInventory.ps1:**
 - Added automated threat detection for processes, services, tasks, connections
@@ -505,13 +570,14 @@ Import-Csv .\csv\security_weaknesses.csv | Where-Object Risk -eq 'Critical'
 - Added console threat summary output
 - Created CCDC-specific documentation
 
-**Compare-WindowsInventory.ps1 (NEW):**
-- Inventory diffing tool for change detection
+**Compare-WindowsInventory.ps1:**
+- Inventory diffing tool for change detection (separate script)
 - Compares snapshots to identify additions/removals
 - Flags suspicious changes with risk levels (High/Medium/Low)
 - Generates HTML diff report with color-coded warnings
 - Exports detailed CSV files for each change category
 - Highlights critical changes (new admins, suspicious services, C2 connections)
+- **Note**: Baseline comparison now integrated into main script in v2.2
 
 ### v2.0 (Original)
 - Comprehensive Windows inventory collection
