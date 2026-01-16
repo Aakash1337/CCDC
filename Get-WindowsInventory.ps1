@@ -38,15 +38,31 @@
 .PARAMETER NoProgress
   Disable progress indicators (useful for scripted/automated runs).
 
+.PARAMETER UpdateBaseline
+  Force update/create baseline with current inventory. Use after system hardening or to refresh baseline.
+
+.PARAMETER BaselinePath
+  Custom baseline directory location (default: .\baseline in script directory).
+
+.PARAMETER SkipComparison
+  Skip baseline comparison even if baseline exists. Use for quick inventory without diff.
+
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\Get-WindowsInventory.ps1
 
 .EXAMPLE
   .\Get-WindowsInventory.ps1 -OutputRoot C:\IR -IncludeEventLogs -Quick -Compress
 
+.EXAMPLE
+  .\Get-WindowsInventory.ps1 -UpdateBaseline
+
+.EXAMPLE
+  .\Get-WindowsInventory.ps1 -BaselinePath "D:\SecureBaseline"
+
 .NOTES
   Run as Administrator for best coverage (SecurityCenter2, some registry keys, firewall rules, etc.).
-  Version: 2.0
+  CCDC READY: Includes threat detection, suspicious activity flagging, and security baseline checks.
+  Version: 2.1 (CCDC Enhanced)
 #>
 
 [CmdletBinding()]
@@ -58,7 +74,10 @@ param(
   [bool]$Firewall = $true,
   [bool]$Certs = $true,
   [switch]$Compress,
-  [switch]$NoProgress
+  [switch]$NoProgress,
+  [switch]$UpdateBaseline,
+  [string]$BaselinePath = "",
+  [switch]$SkipComparison
 )
 
 Set-StrictMode -Version Latest
@@ -68,7 +87,7 @@ $ErrorActionPreference = 'Continue'
 $script:LogPath = $null
 $script:ErrorLog = @()
 $script:StartTime = Get-Date
-$script:TotalSteps = 20
+$script:TotalSteps = 25
 $script:CurrentStep = 0
 
 # ---------------------------- Helpers ----------------------------
@@ -167,10 +186,10 @@ function Write-TextFile {
 
 function Export-CsvSafe {
   param(
-    [Parameter(Mandatory)][object[]]$Data,
+    [Parameter(Mandatory)]$Data,
     [Parameter(Mandatory)][string]$Path
   )
-  if ($null -eq $Data -or $Data.Count -eq 0) {
+  if ($null -eq $Data -or @($Data).Count -eq 0) {
     "" | Out-File -FilePath $Path -Encoding UTF8 -Force
     return
   }
@@ -270,6 +289,743 @@ function Compress-ReportFolder {
   return $null
 }
 
+# ---------------------------- Baseline Management Functions ----------------------------
+
+function Get-BaselineDirectory {
+  param([string]$CustomPath)
+
+  if ($CustomPath) {
+    return $CustomPath
+  }
+
+  $scriptDir = Split-Path -Parent $MyInvocation.ScriptName
+  if (-not $scriptDir) {
+    $scriptDir = Get-Location
+  }
+
+  return Join-Path $scriptDir "baseline"
+}
+
+function Test-BaselineExists {
+  param([string]$BaselineDir)
+
+  $metadataPath = Join-Path $BaselineDir "baseline_metadata.json"
+  return (Test-Path $metadataPath)
+}
+
+function Save-Baseline {
+  param(
+    [Parameter(Mandatory)][string]$BaselineDir,
+    [Parameter(Mandatory)][hashtable]$Inventory
+  )
+
+  try {
+    # Create baseline directory if it doesn't exist
+    if (-not (Test-Path $BaselineDir)) {
+      New-Item -ItemType Directory -Path $BaselineDir -Force | Out-Null
+    }
+
+    Write-LogEntry "Saving baseline to $BaselineDir"
+
+    # Save metadata
+    $metadata = @{
+      CreatedAt = (Get-Date).ToString("o")
+      ComputerName = $env:COMPUTERNAME
+      Version = "2.1-CCDC"
+    }
+    $metadataPath = Join-Path $BaselineDir "baseline_metadata.json"
+    ($metadata | ConvertTo-Json) | Out-File -FilePath $metadataPath -Encoding UTF8 -Force
+
+    # Copy CSV files to baseline
+    $csvMappings = @{
+      "baseline_processes.csv" = $Inventory.Processes.Csv
+      "baseline_services.csv" = $Inventory.Services.Csv
+      "baseline_tasks.csv" = $Inventory.Tasks.Csv
+      "baseline_users.csv" = $Inventory.Users.UsersCsv
+      "baseline_group_members.csv" = $Inventory.Users.MembersCsv
+      "baseline_software.csv" = $Inventory.Software.UninstallCsv
+      "baseline_autoruns.csv" = $Inventory.Autoruns.Csv
+      "baseline_connections.csv" = $Inventory.EstablishedConnections.Csv
+      "baseline_patches.csv" = $Inventory.Patches.Csv
+      "baseline_shares.csv" = $Inventory.Shares.Csv
+    }
+
+    foreach ($baseline in $csvMappings.Keys) {
+      $sourcePath = $csvMappings[$baseline]
+      if ($sourcePath -and (Test-Path $sourcePath)) {
+        $destPath = Join-Path $BaselineDir $baseline
+        Copy-Item -Path $sourcePath -Destination $destPath -Force
+      }
+    }
+
+    Write-LogEntry "Baseline saved successfully" -Level "SUCCESS"
+    return $true
+  } catch {
+    Write-LogEntry "Failed to save baseline: $_" -Level "ERROR"
+    Add-ErrorEntry -Function "Save-Baseline" -Error $_.Exception.Message
+    return $false
+  }
+}
+
+function Compare-WithBaseline {
+  param(
+    [Parameter(Mandatory)][string]$BaselineDir,
+    [Parameter(Mandatory)][hashtable]$CurrentInventory,
+    [Parameter(Mandatory)][string]$ComparisonCsvDir
+  )
+
+  $comparison = @{
+    Processes = @{ Added = @(); Removed = @(); Count = 0; Csv = $null }
+    Services = @{ Added = @(); Removed = @(); Count = 0; Csv = $null }
+    Tasks = @{ Added = @(); Removed = @(); Count = 0; Csv = $null }
+    Users = @{ Added = @(); Removed = @(); Count = 0; Csv = $null }
+    Admins = @{ Added = @(); Removed = @(); Count = 0; Csv = $null }
+    Software = @{ Added = @(); Removed = @(); Count = 0; Csv = $null }
+    Autoruns = @{ Added = @(); Removed = @(); Count = 0; Csv = $null }
+    Shares = @{ Added = @(); Removed = @(); Count = 0; Csv = $null }
+    TotalChanges = 0
+  }
+
+  try {
+    # Load baseline metadata
+    $metadataPath = Join-Path $BaselineDir "baseline_metadata.json"
+    $metadata = Get-Content $metadataPath -Raw | ConvertFrom-Json
+    $comparison.BaselineDate = $metadata.CreatedAt
+
+    # Compare Processes
+    $baselineProc = Join-Path $BaselineDir "baseline_processes.csv"
+    if ((Test-Path $baselineProc) -and $CurrentInventory.Processes.Csv -and (Test-Path $CurrentInventory.Processes.Csv)) {
+      $baseData = Import-Csv $baselineProc
+      $currData = Import-Csv $CurrentInventory.Processes.Csv
+
+      $baseNames = $baseData | Select-Object -ExpandProperty Name -Unique
+      $currNames = $currData | Select-Object -ExpandProperty Name -Unique
+
+      $addedNames = @($currNames | Where-Object { $_ -notin $baseNames })
+      $removedNames = @($baseNames | Where-Object { $_ -notin $currNames })
+
+      $comparison.Processes.Added = $addedNames
+      $comparison.Processes.Removed = $removedNames
+      $comparison.Processes.Count = $addedNames.Count + $removedNames.Count
+
+      # Save comparison CSV
+      if ($comparison.Processes.Count -gt 0) {
+        $comparisonData = @()
+        foreach ($name in $addedNames) {
+          $proc = $currData | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "ADDED"
+            Name = $name
+            Id = $proc.Id
+            Path = $proc.Path
+            CommandLine = $proc.CommandLine
+          }
+        }
+        foreach ($name in $removedNames) {
+          $proc = $baseData | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "REMOVED"
+            Name = $name
+            Id = $proc.Id
+            Path = $proc.Path
+            CommandLine = $proc.CommandLine
+          }
+        }
+        $compCsv = Join-Path $ComparisonCsvDir "comparison_processes.csv"
+        Export-CsvSafe -Data $comparisonData -Path $compCsv
+        $comparison.Processes.Csv = $compCsv
+      }
+    }
+
+    # Compare Services
+    $baselineSvc = Join-Path $BaselineDir "baseline_services.csv"
+    if ((Test-Path $baselineSvc) -and $CurrentInventory.Services.Csv -and (Test-Path $CurrentInventory.Services.Csv)) {
+      $baseData = Import-Csv $baselineSvc
+      $currData = Import-Csv $CurrentInventory.Services.Csv
+
+      $baseNames = $baseData | Select-Object -ExpandProperty Name -Unique
+      $currNames = $currData | Select-Object -ExpandProperty Name -Unique
+
+      $addedNames = @($currNames | Where-Object { $_ -notin $baseNames })
+      $removedNames = @($baseNames | Where-Object { $_ -notin $currNames })
+
+      $comparison.Services.Added = $addedNames
+      $comparison.Services.Removed = $removedNames
+      $comparison.Services.Count = $addedNames.Count + $removedNames.Count
+
+      # Save comparison CSV
+      if ($comparison.Services.Count -gt 0) {
+        $comparisonData = @()
+        foreach ($name in $addedNames) {
+          $svc = $currData | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "ADDED"
+            Name = $name
+            DisplayName = $svc.DisplayName
+            State = $svc.State
+            StartMode = $svc.StartMode
+            PathName = $svc.PathName
+          }
+        }
+        foreach ($name in $removedNames) {
+          $svc = $baseData | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "REMOVED"
+            Name = $name
+            DisplayName = $svc.DisplayName
+            State = $svc.State
+            StartMode = $svc.StartMode
+            PathName = $svc.PathName
+          }
+        }
+        $compCsv = Join-Path $ComparisonCsvDir "comparison_services.csv"
+        Export-CsvSafe -Data $comparisonData -Path $compCsv
+        $comparison.Services.Csv = $compCsv
+      }
+    }
+
+    # Compare Scheduled Tasks
+    $baselineTask = Join-Path $BaselineDir "baseline_tasks.csv"
+    if ((Test-Path $baselineTask) -and $CurrentInventory.Tasks.Csv -and (Test-Path $CurrentInventory.Tasks.Csv)) {
+      $baseData = Import-Csv $baselineTask
+      $currData = Import-Csv $CurrentInventory.Tasks.Csv
+
+      $baseNames = $baseData | Select-Object -ExpandProperty TaskName -Unique
+      $currNames = $currData | Select-Object -ExpandProperty TaskName -Unique
+
+      $addedNames = @($currNames | Where-Object { $_ -notin $baseNames })
+      $removedNames = @($baseNames | Where-Object { $_ -notin $currNames })
+
+      $comparison.Tasks.Added = $addedNames
+      $comparison.Tasks.Removed = $removedNames
+      $comparison.Tasks.Count = $addedNames.Count + $removedNames.Count
+
+      # Save comparison CSV
+      if ($comparison.Tasks.Count -gt 0) {
+        $comparisonData = @()
+        foreach ($name in $addedNames) {
+          $task = $currData | Where-Object { $_.TaskName -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "ADDED"
+            TaskName = $name
+            TaskPath = $task.TaskPath
+            State = $task.State
+            Author = $task.Author
+            Actions = $task.Actions
+          }
+        }
+        foreach ($name in $removedNames) {
+          $task = $baseData | Where-Object { $_.TaskName -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "REMOVED"
+            TaskName = $name
+            TaskPath = $task.TaskPath
+            State = $task.State
+            Author = $task.Author
+            Actions = $task.Actions
+          }
+        }
+        $compCsv = Join-Path $ComparisonCsvDir "comparison_tasks.csv"
+        Export-CsvSafe -Data $comparisonData -Path $compCsv
+        $comparison.Tasks.Csv = $compCsv
+      }
+    }
+
+    # Compare Users
+    $baselineUsers = Join-Path $BaselineDir "baseline_users.csv"
+    if ((Test-Path $baselineUsers) -and $CurrentInventory.Users.UsersCsv -and (Test-Path $CurrentInventory.Users.UsersCsv)) {
+      $baseData = Import-Csv $baselineUsers
+      $currData = Import-Csv $CurrentInventory.Users.UsersCsv
+
+      $baseNames = $baseData | Select-Object -ExpandProperty Name -Unique
+      $currNames = $currData | Select-Object -ExpandProperty Name -Unique
+
+      $addedNames = @($currNames | Where-Object { $_ -notin $baseNames })
+      $removedNames = @($baseNames | Where-Object { $_ -notin $currNames })
+
+      $comparison.Users.Added = $addedNames
+      $comparison.Users.Removed = $removedNames
+      $comparison.Users.Count = $addedNames.Count + $removedNames.Count
+
+      # Save comparison CSV
+      if ($comparison.Users.Count -gt 0) {
+        $comparisonData = @()
+        foreach ($name in $addedNames) {
+          $user = $currData | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "ADDED"
+            Name = $name
+            Enabled = $user.Enabled
+            LastLogon = $user.LastLogon
+            Description = $user.Description
+          }
+        }
+        foreach ($name in $removedNames) {
+          $user = $baseData | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "REMOVED"
+            Name = $name
+            Enabled = $user.Enabled
+            LastLogon = $user.LastLogon
+            Description = $user.Description
+          }
+        }
+        $compCsv = Join-Path $ComparisonCsvDir "comparison_users.csv"
+        Export-CsvSafe -Data $comparisonData -Path $compCsv
+        $comparison.Users.Csv = $compCsv
+      }
+    }
+
+    # Compare Administrators
+    $baselineAdmins = Join-Path $BaselineDir "baseline_group_members.csv"
+    if ((Test-Path $baselineAdmins) -and $CurrentInventory.Users.MembersCsv -and (Test-Path $CurrentInventory.Users.MembersCsv)) {
+      $baseData = Import-Csv $baselineAdmins | Where-Object { $_.Group -match 'Administrators' }
+      $currData = Import-Csv $CurrentInventory.Users.MembersCsv | Where-Object { $_.Group -match 'Administrators' }
+
+      $baseMembers = $baseData | Select-Object -ExpandProperty Member -Unique
+      $currMembers = $currData | Select-Object -ExpandProperty Member -Unique
+
+      $addedMembers = @($currMembers | Where-Object { $_ -notin $baseMembers })
+      $removedMembers = @($baseMembers | Where-Object { $_ -notin $currMembers })
+
+      $comparison.Admins.Added = $addedMembers
+      $comparison.Admins.Removed = $removedMembers
+      $comparison.Admins.Count = $addedMembers.Count + $removedMembers.Count
+
+      # Save comparison CSV
+      if ($comparison.Admins.Count -gt 0) {
+        $comparisonData = @()
+        foreach ($member in $addedMembers) {
+          $admin = $currData | Where-Object { $_.Member -eq $member } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "ADDED"
+            Member = $member
+            Group = $admin.Group
+            ObjectClass = $admin.ObjectClass
+            PrincipalSource = $admin.PrincipalSource
+          }
+        }
+        foreach ($member in $removedMembers) {
+          $admin = $baseData | Where-Object { $_.Member -eq $member } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "REMOVED"
+            Member = $member
+            Group = $admin.Group
+            ObjectClass = $admin.ObjectClass
+            PrincipalSource = $admin.PrincipalSource
+          }
+        }
+        $compCsv = Join-Path $ComparisonCsvDir "comparison_administrators.csv"
+        Export-CsvSafe -Data $comparisonData -Path $compCsv
+        $comparison.Admins.Csv = $compCsv
+      }
+    }
+
+    # Compare Software
+    $baselineSoft = Join-Path $BaselineDir "baseline_software.csv"
+    if ((Test-Path $baselineSoft) -and $CurrentInventory.Software.UninstallCsv -and (Test-Path $CurrentInventory.Software.UninstallCsv)) {
+      $baseData = Import-Csv $baselineSoft
+      $currData = Import-Csv $CurrentInventory.Software.UninstallCsv
+
+      $baseNames = $baseData | Select-Object -ExpandProperty DisplayName -Unique
+      $currNames = $currData | Select-Object -ExpandProperty DisplayName -Unique
+
+      $addedNames = @($currNames | Where-Object { $_ -notin $baseNames })
+      $removedNames = @($baseNames | Where-Object { $_ -notin $currNames })
+
+      $comparison.Software.Added = $addedNames
+      $comparison.Software.Removed = $removedNames
+      $comparison.Software.Count = $addedNames.Count + $removedNames.Count
+
+      # Save comparison CSV
+      if ($comparison.Software.Count -gt 0) {
+        $comparisonData = @()
+        foreach ($name in $addedNames) {
+          $sw = $currData | Where-Object { $_.DisplayName -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "ADDED"
+            DisplayName = $name
+            DisplayVersion = $sw.DisplayVersion
+            Publisher = $sw.Publisher
+            InstallDate = $sw.InstallDate
+          }
+        }
+        foreach ($name in $removedNames) {
+          $sw = $baseData | Where-Object { $_.DisplayName -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "REMOVED"
+            DisplayName = $name
+            DisplayVersion = $sw.DisplayVersion
+            Publisher = $sw.Publisher
+            InstallDate = $sw.InstallDate
+          }
+        }
+        $compCsv = Join-Path $ComparisonCsvDir "comparison_software.csv"
+        Export-CsvSafe -Data $comparisonData -Path $compCsv
+        $comparison.Software.Csv = $compCsv
+      }
+    }
+
+    # Compare Autoruns
+    $baselineAuto = Join-Path $BaselineDir "baseline_autoruns.csv"
+    if ((Test-Path $baselineAuto) -and $CurrentInventory.Autoruns.Csv -and (Test-Path $CurrentInventory.Autoruns.Csv)) {
+      $baseData = Import-Csv $baselineAuto
+      $currData = Import-Csv $CurrentInventory.Autoruns.Csv
+
+      $baseItems = $baseData | ForEach-Object { "$($_.Location)|$($_.Name)" }
+      $currItems = $currData | ForEach-Object { "$($_.Location)|$($_.Name)" }
+
+      $addedItems = @($currItems | Where-Object { $_ -notin $baseItems })
+      $removedItems = @($baseItems | Where-Object { $_ -notin $currItems })
+
+      $comparison.Autoruns.Added = @($addedItems | ForEach-Object { $_.Split('|')[1] })
+      $comparison.Autoruns.Removed = @($removedItems | ForEach-Object { $_.Split('|')[1] })
+      $comparison.Autoruns.Count = $addedItems.Count + $removedItems.Count
+
+      # Save comparison CSV
+      if ($comparison.Autoruns.Count -gt 0) {
+        $comparisonData = @()
+        foreach ($item in $addedItems) {
+          $parts = $item.Split('|')
+          $autorun = $currData | Where-Object { $_.Location -eq $parts[0] -and $_.Name -eq $parts[1] } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "ADDED"
+            Name = $parts[1]
+            Location = $parts[0]
+            Type = $autorun.Type
+            Value = $autorun.Value
+          }
+        }
+        foreach ($item in $removedItems) {
+          $parts = $item.Split('|')
+          $autorun = $baseData | Where-Object { $_.Location -eq $parts[0] -and $_.Name -eq $parts[1] } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "REMOVED"
+            Name = $parts[1]
+            Location = $parts[0]
+            Type = $autorun.Type
+            Value = $autorun.Value
+          }
+        }
+        $compCsv = Join-Path $ComparisonCsvDir "comparison_autoruns.csv"
+        Export-CsvSafe -Data $comparisonData -Path $compCsv
+        $comparison.Autoruns.Csv = $compCsv
+      }
+    }
+
+    # Compare Shares
+    $baselineShares = Join-Path $BaselineDir "baseline_shares.csv"
+    if ((Test-Path $baselineShares) -and $CurrentInventory.Shares.Csv -and (Test-Path $CurrentInventory.Shares.Csv)) {
+      $baseData = Import-Csv $baselineShares
+      $currData = Import-Csv $CurrentInventory.Shares.Csv
+
+      $baseNames = $baseData | Select-Object -ExpandProperty Name -Unique
+      $currNames = $currData | Select-Object -ExpandProperty Name -Unique
+
+      $addedNames = @($currNames | Where-Object { $_ -notin $baseNames })
+      $removedNames = @($baseNames | Where-Object { $_ -notin $currNames })
+
+      $comparison.Shares.Added = $addedNames
+      $comparison.Shares.Removed = $removedNames
+      $comparison.Shares.Count = $addedNames.Count + $removedNames.Count
+
+      # Save comparison CSV
+      if ($comparison.Shares.Count -gt 0) {
+        $comparisonData = @()
+        foreach ($name in $addedNames) {
+          $share = $currData | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "ADDED"
+            Name = $name
+            Path = $share.Path
+            Description = $share.Description
+          }
+        }
+        foreach ($name in $removedNames) {
+          $share = $baseData | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+          $comparisonData += [pscustomobject]@{
+            Change = "REMOVED"
+            Name = $name
+            Path = $share.Path
+            Description = $share.Description
+          }
+        }
+        $compCsv = Join-Path $ComparisonCsvDir "comparison_shares.csv"
+        Export-CsvSafe -Data $comparisonData -Path $compCsv
+        $comparison.Shares.Csv = $compCsv
+      }
+    }
+
+    # Calculate total changes
+    $comparison.TotalChanges = $comparison.Processes.Count + $comparison.Services.Count +
+                               $comparison.Tasks.Count + $comparison.Users.Count +
+                               $comparison.Admins.Count + $comparison.Software.Count +
+                               $comparison.Autoruns.Count + $comparison.Shares.Count
+
+    Write-LogEntry "Baseline comparison complete: $($comparison.TotalChanges) total changes detected"
+
+    return $comparison
+  } catch {
+    Write-LogEntry "Failed to compare with baseline: $_" -Level "ERROR"
+    Add-ErrorEntry -Function "Compare-WithBaseline" -Error $_.Exception.Message
+    return $null
+  }
+}
+
+# ---------------------------- CCDC Threat Detection Functions ----------------------------
+
+function Test-SuspiciousProcess {
+  param([object]$Process)
+
+  $suspicious = @()
+
+  # Get path from either Path or ExecutablePath property, handling null
+  $path = $null
+  if ($Process.PSObject.Properties['Path'] -and $Process.Path) {
+    $path = $Process.Path
+  } elseif ($Process.PSObject.Properties['ExecutablePath'] -and $Process.ExecutablePath) {
+    $path = $Process.ExecutablePath
+  }
+
+  # Only check paths if we have one
+  if ($path) {
+    # Check for suspicious paths
+    if ($path -match '(temp|appdata\\local\\temp|public|programdata|users\\public|windows\\temp)') {
+      $suspicious += "Running from suspicious location: $path"
+    }
+
+    # Check for double extensions
+    if ($path -match '\.(pdf|doc|xls|jpg|png|txt)\.(exe|scr|pif|bat|cmd|vbs|js)$') {
+      $suspicious += "Double extension detected: $path"
+    }
+  }
+
+  # Check for suspicious names (always available)
+  if ($Process.Name -match '^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32)$') {
+    $suspicious += "Suspicious process name: $($Process.Name)"
+  }
+
+  return ,$suspicious
+}
+
+function Test-SuspiciousService {
+  param([object]$Service)
+
+  $suspicious = @()
+  $path = $Service.PathName
+
+  # Check for suspicious paths
+  if ($path -match '(temp|appdata|public|programdata|users)' -and $Service.StartMode -eq 'Auto') {
+    $suspicious += "Auto-start service in user directory: $path"
+  }
+
+  # Check for services running as SYSTEM from suspicious locations
+  if ($Service.StartName -eq 'LocalSystem' -and $path -match '(users|temp)') {
+    $suspicious += "SYSTEM service in user directory: $path"
+  }
+
+  # Check for encoded commands
+  if ($path -match '-enc|-encodedcommand') {
+    $suspicious += "Service using encoded commands: $path"
+  }
+
+  return ,$suspicious
+}
+
+function Test-SuspiciousScheduledTask {
+  param([object]$Task)
+
+  $suspicious = @()
+  $actions = $Task.Actions
+
+  # Check for suspicious actions
+  if ($actions -match '(temp|appdata\\local\\temp|public|programdata\\public)') {
+    $suspicious += "Task runs from suspicious location: $actions"
+  }
+
+  # Check for PowerShell with encoded commands
+  if ($actions -match 'powershell.*(-enc|-encodedcommand|-w hidden|-windowstyle hidden)') {
+    $suspicious += "Task uses hidden/encoded PowerShell: $actions"
+  }
+
+  # Check for tasks running as SYSTEM
+  if ($Task.TaskPath -match '\\Microsoft\\Windows\\' -and $Task.Author -notmatch 'Microsoft') {
+    $suspicious += "Non-Microsoft task in Microsoft folder: $($Task.TaskPath)"
+  }
+
+  return ,$suspicious
+}
+
+function Test-UnauthorizedAdmin {
+  param([object]$GroupMember)
+
+  # Common legitimate admin accounts (customize for your environment)
+  $legitimateAdmins = @(
+    'Administrator',
+    'Domain Admins',
+    'Enterprise Admins'
+  )
+
+  if ($GroupMember.Group -match 'Administrators' -and
+      $GroupMember.Member -notmatch ($legitimateAdmins -join '|')) {
+    return $true
+  }
+
+  return $false
+}
+
+function Get-RecentFileModifications {
+  param([int]$Hours = 24)
+
+  $since = (Get-Date).AddHours(-$Hours)
+  $suspiciousPaths = @(
+    "$env:SystemRoot\System32\drivers\etc",
+    "$env:SystemRoot\System32\drivers",
+    "$env:SystemRoot\System32",
+    "$env:SystemRoot\SysWOW64"
+  )
+
+  $modifications = @()
+  foreach ($path in $suspiciousPaths) {
+    if (Test-Path $path) {
+      try {
+        $files = Get-ChildItem $path -File -ErrorAction SilentlyContinue |
+          Where-Object { $_.LastWriteTime -gt $since }
+
+        foreach ($file in $files) {
+          $modifications += [pscustomobject]@{
+            Path = $file.FullName
+            LastWriteTime = $file.LastWriteTime
+            Size = $file.Length
+            Hash = (Get-FileHashSafe $file.FullName)
+          }
+        }
+      } catch {}
+    }
+  }
+
+  return ,$modifications
+}
+
+function Get-SuspiciousNetworkConnections {
+  param([object[]]$Connections)
+
+  $suspicious = @()
+
+  foreach ($conn in $Connections) {
+    # Check for connections to common C2 ports
+    if ($conn.RemotePort -in @(4444, 5555, 6666, 7777, 8888, 31337, 1337)) {
+      $suspicious += [pscustomobject]@{
+        LocalAddress = $conn.LocalAddress
+        LocalPort = $conn.LocalPort
+        RemoteAddress = $conn.RemoteAddress
+        RemotePort = $conn.RemotePort
+        ProcessId = $conn.ProcessId
+        ProcessName = $conn.ProcessName
+        Reason = "Common C2 port: $($conn.RemotePort)"
+      }
+    }
+
+    # Check for non-standard ports on common processes
+    if ($conn.ProcessName -match '^(notepad|calc|mspaint)$' -and $conn.RemotePort -ne 0) {
+      $suspicious += [pscustomobject]@{
+        LocalAddress = $conn.LocalAddress
+        LocalPort = $conn.LocalPort
+        RemoteAddress = $conn.RemoteAddress
+        RemotePort = $conn.RemotePort
+        ProcessId = $conn.ProcessId
+        ProcessName = $conn.ProcessName
+        Reason = "Unusual process with network connection: $($conn.ProcessName)"
+      }
+    }
+  }
+
+  return ,$suspicious
+}
+
+function Get-SecurityWeaknesses {
+  $weaknesses = @()
+
+  # Check UAC
+  $uacEnabled = Get-RegistryValueSafe "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "EnableLUA"
+  if ($uacEnabled -ne 1) {
+    $weaknesses += [pscustomobject]@{
+      Category = "UAC"
+      Issue = "User Account Control is disabled"
+      Risk = "High"
+      Recommendation = "Enable UAC"
+    }
+  }
+
+  # Check RDP
+  $rdpDeny = Get-RegistryValueSafe "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" "fDenyTSConnections"
+  if ($rdpDeny -eq 0) {
+    $weaknesses += [pscustomobject]@{
+      Category = "RDP"
+      Issue = "Remote Desktop is enabled"
+      Risk = "Medium"
+      Recommendation = "Disable RDP if not needed, or restrict access"
+    }
+  }
+
+  # Check Windows Firewall
+  if (Test-Command "Get-NetFirewallProfile") {
+    try {
+      $profiles = Get-NetFirewallProfile -ErrorAction Stop
+      foreach ($profile in $profiles) {
+        if (-not $profile.Enabled) {
+          $weaknesses += [pscustomobject]@{
+            Category = "Firewall"
+            Issue = "Windows Firewall is disabled for $($profile.Name) profile"
+            Risk = "High"
+            Recommendation = "Enable Windows Firewall for all profiles"
+          }
+        }
+      }
+    } catch {}
+  }
+
+  # Check Windows Defender
+  if (Test-Command "Get-MpComputerStatus") {
+    try {
+      $defender = Get-MpComputerStatus -ErrorAction Stop
+      if (-not $defender.RealTimeProtectionEnabled) {
+        $weaknesses += [pscustomobject]@{
+          Category = "Antivirus"
+          Issue = "Windows Defender Real-Time Protection is disabled"
+          Risk = "Critical"
+          Recommendation = "Enable Real-Time Protection immediately"
+        }
+      }
+      if (-not $defender.AntivirusEnabled) {
+        $weaknesses += [pscustomobject]@{
+          Category = "Antivirus"
+          Issue = "Windows Defender is disabled"
+          Risk = "Critical"
+          Recommendation = "Enable Windows Defender immediately"
+        }
+      }
+    } catch {}
+  }
+
+  # Check Guest account
+  if (Test-Command "Get-LocalUser") {
+    try {
+      $guest = Get-LocalUser -Name "Guest" -ErrorAction SilentlyContinue
+      if ($guest -and $guest.Enabled) {
+        $weaknesses += [pscustomobject]@{
+          Category = "User Accounts"
+          Issue = "Guest account is enabled"
+          Risk = "Medium"
+          Recommendation = "Disable Guest account"
+        }
+      }
+    } catch {}
+  }
+
+  return ,$weaknesses
+}
+
 # ---------------------------- Collection Functions ----------------------------
 
 function Get-SystemSummary {
@@ -310,9 +1066,21 @@ function Get-SystemSummary {
   }
 
   $lastBoot = $null
-  try { 
+  try {
     $lastBoot = [Management.ManagementDateTimeConverter]::ToDateTime($os.LastBootUpTime)
   } catch {}
+
+  $installDate = $null
+  try {
+    $installDate = [Management.ManagementDateTimeConverter]::ToDateTime($os.InstallDate)
+  } catch {}
+
+  $uptimeHours = $null
+  if ($lastBoot) {
+    try {
+      $uptimeHours = [math]::Round(((Get-Date) - $lastBoot).TotalHours, 2)
+    } catch {}
+  }
 
   $totalMemGB = $null
   try {
@@ -329,17 +1097,9 @@ function Get-SystemSummary {
     OSVersion            = $os.Version
     OSBuildNumber        = $os.BuildNumber
     OSArchitecture       = $os.OSArchitecture
-    InstallDate          = (try { 
-      [Management.ManagementDateTimeConverter]::ToDateTime($os.InstallDate) 
-    } catch { 
-      $null 
-    })
+    InstallDate          = $installDate
     LastBootUpTime       = $lastBoot
-    UptimeHours          = (if ($lastBoot) { 
-      [math]::Round(((Get-Date) - $lastBoot).TotalHours, 2) 
-    } else { 
-      $null 
-    })
+    UptimeHours          = $uptimeHours
     BIOSVersion          = ($bios.SMBIOSBIOSVersion)
     BIOSSerial           = ($bios.SerialNumber)
     CPUName              = ($cpu | Select-Object -First 1 -ExpandProperty Name)
@@ -421,11 +1181,14 @@ function Get-NetworkInfo {
 
 function Get-DNSCache {
   $cache = @()
-  
+
   if (Test-Command "Get-DnsClientCache") {
     try {
-      $cache = Get-DnsClientCache -ErrorAction Stop | 
+      $result = Get-DnsClientCache -ErrorAction Stop |
         Select-Object Entry, RecordName, RecordType, Data, TimeToLive
+      if ($result) {
+        $cache = @($result)
+      }
     } catch {
       Add-ErrorEntry -Function "Get-DNSCache" -Error "Failed to get DNS cache: $_"
     }
@@ -433,8 +1196,8 @@ function Get-DNSCache {
     $raw = (Invoke-ExeCapture -File "ipconfig" -Args @("/displaydns")).StdOut
     $cache = @([pscustomobject]@{ Note="ipconfig /displaydns raw"; Raw=$raw })
   }
-  
-  return $cache
+
+  return ,$cache
 }
 
 function Get-OpenPortsAndNetstat {
@@ -503,7 +1266,7 @@ function Get-NetworkConnectionsEnhanced {
     }
   }
   
-  return $connections
+  return ,$connections
 }
 
 function Get-ServicesAndProcesses {
@@ -633,25 +1396,48 @@ function Get-ScheduledTasksInfo {
     try {
       $tasks = Get-ScheduledTask -ErrorAction Stop | ForEach-Object {
         $info = $null
-        try { 
+        try {
           $info = Get-ScheduledTaskInfo -TaskName $_.TaskName -TaskPath $_.TaskPath -ErrorAction SilentlyContinue
         } catch {}
-        
+
+        # Pre-calculate values to avoid inline if statements
+        $lastRunTime = if ($info) { $info.LastRunTime } else { $null }
+        $nextRunTime = if ($info) { $info.NextRunTime } else { $null }
+        $lastTaskResult = if ($info) { $info.LastTaskResult } else { $null }
+
+        # Safely format actions
+        $actionsText = ""
+        if ($_.Actions) {
+          $actionsText = (($_.Actions | ForEach-Object {
+            if (-not $_) { return "" }
+            try {
+              $exe = if ($_.PSObject.Properties['Execute']) { $_.Execute } else { "" }
+              $args = if ($_.PSObject.Properties['Arguments']) { $_.Arguments } else { "" }
+              if ($exe) {
+                "$exe $args".Trim()
+              } else {
+                try { $_.ToString() } catch { "" }
+              }
+            } catch {
+              try { if ($_) { $_.ToString() } else { "" } } catch { "" }
+            }
+          }) -join "; ")
+        }
+
         [pscustomobject]@{
           TaskName     = $_.TaskName
           TaskPath     = $_.TaskPath
           State        = $_.State
           Author       = $_.Author
           Description  = $_.Description
-          Actions      = (($_.Actions | ForEach-Object { 
-            "$($_.Execute) $($_.Arguments)" 
+          Actions      = $actionsText
+          Triggers     = (($_.Triggers | ForEach-Object {
+            if (-not $_) { return "" }
+            try { $_.ToString() } catch { "" }
           }) -join "; ")
-          Triggers     = (($_.Triggers | ForEach-Object { 
-            $_.ToString() 
-          }) -join "; ")
-          LastRunTime  = (if ($info) { $info.LastRunTime } else { $null })
-          NextRunTime  = (if ($info) { $info.NextRunTime } else { $null })
-          LastTaskResult = (if ($info) { $info.LastTaskResult } else { $null })
+          LastRunTime  = $lastRunTime
+          NextRunTime  = $nextRunTime
+          LastTaskResult = $lastTaskResult
         }
       }
     } catch {
@@ -674,7 +1460,7 @@ function Get-ScheduledTasksInfo {
     }
   }
 
-  return $tasks
+  return ,$tasks
 }
 
 function Get-AutorunsInfo {
@@ -737,7 +1523,7 @@ function Get-AutorunsInfo {
     } catch {}
   }
   
-  return $autoruns
+  return ,$autoruns
 }
 
 function Get-PersistenceLocations {
@@ -822,7 +1608,7 @@ function Get-PatchInfo {
   } catch {
     Add-ErrorEntry -Function "Get-PatchInfo" -Error "Failed to get hotfix info: $_"
   }
-  return $hotfix
+  return ,$hotfix
 }
 
 function Get-FirewallInfo {
@@ -949,7 +1735,7 @@ function Get-SharesInfo {
       Raw=$raw 
     })
   }
-  return $shares
+  return ,$shares
 }
 
 function Get-CertificatesLocalMachine {
@@ -977,7 +1763,7 @@ function Get-CertificatesLocalMachine {
   } catch {
     Add-ErrorEntry -Function "Get-CertificatesLocalMachine" -Error "Failed to get certificates: $_"
   }
-  return $certs
+  return ,$certs
 }
 
 function Get-CriticalFileHashes {
@@ -1003,7 +1789,7 @@ function Get-CriticalFileHashes {
     }
   }
   
-  return $hashes
+  return ,$hashes
 }
 
 function Get-EventLogSummary24h {
@@ -1038,7 +1824,7 @@ function Get-EventLogSummary24h {
       }
     }
   }
-  return $summaries
+  return ,$summaries
 }
 
 # ---------------------------- Main Execution ----------------------------
@@ -1064,7 +1850,7 @@ Write-LogEntry "Running as Administrator: $(Is-Admin)"
 $inventory = [ordered]@{
   Metadata = [ordered]@{
     ScriptName       = "Get-WindowsInventory.ps1"
-    Version          = "2.0"
+    Version          = "2.1-CCDC"
     QuickMode        = [bool]$Quick
     IncludeEventLogs = [bool]$IncludeEventLogs
     CollectedAt      = (Get-Date).ToString("o")
@@ -1097,6 +1883,15 @@ $inventory = [ordered]@{
   CriticalFiles = [ordered]@{ Csv = $null; Count = 0 }
   Artifacts  = [ordered]@{}
   FileHashes = [ordered]@{}
+  ThreatAnalysis = [ordered]@{
+    SuspiciousProcesses = [ordered]@{ Csv = $null; Count = 0 }
+    SuspiciousServices = [ordered]@{ Csv = $null; Count = 0 }
+    SuspiciousTasks = [ordered]@{ Csv = $null; Count = 0 }
+    SuspiciousConnections = [ordered]@{ Csv = $null; Count = 0 }
+    UnauthorizedAdmins = [ordered]@{ Csv = $null; Count = 0 }
+    SecurityWeaknesses = [ordered]@{ Csv = $null; Count = 0 }
+    RecentModifications = [ordered]@{ Csv = $null; Count = 0 }
+  }
 }
 
 # Step 1: System Summary
@@ -1354,7 +2149,141 @@ if ($IncludeEventLogs) {
   $inventory.Artifacts.EventLogSummary24h = $evCsv
 }
 
-# Step 20: Additional Baseline Artifacts
+# Step 20: CCDC Threat Analysis - Suspicious Processes
+Update-Progress "Analyzing processes for threats..."
+Write-LogEntry "Running threat analysis on processes"
+$suspiciousProcs = @()
+foreach ($proc in $sp.Processes) {
+  $findings = Test-SuspiciousProcess -Process $proc
+  if ($findings.Count -gt 0) {
+    $suspiciousProcs += [pscustomobject]@{
+      Name = $proc.Name
+      Id = $proc.Id
+      Path = if ($proc.Path) { $proc.Path } else { $proc.ExecutablePath }
+      CommandLine = $proc.CommandLine
+      Findings = ($findings -join "; ")
+    }
+  }
+}
+if ($suspiciousProcs.Count -gt 0) {
+  $suspProcCsv = Join-Path $csvDir "threat_suspicious_processes.csv"
+  Export-CsvSafe -Data $suspiciousProcs -Path $suspProcCsv
+  $inventory.ThreatAnalysis.SuspiciousProcesses.Csv = $suspProcCsv
+  $inventory.ThreatAnalysis.SuspiciousProcesses.Count = $suspiciousProcs.Count
+  Write-LogEntry "Found $($suspiciousProcs.Count) suspicious processes" -Level "WARN"
+}
+
+# Step 21: CCDC Threat Analysis - Suspicious Services
+Update-Progress "Analyzing services for threats..."
+Write-LogEntry "Running threat analysis on services"
+$suspiciousServices = @()
+foreach ($svc in $sp.Services) {
+  $findings = Test-SuspiciousService -Service $svc
+  if ($findings.Count -gt 0) {
+    $suspiciousServices += [pscustomobject]@{
+      Name = $svc.Name
+      DisplayName = $svc.DisplayName
+      State = $svc.State
+      StartMode = $svc.StartMode
+      PathName = $svc.PathName
+      StartName = $svc.StartName
+      Findings = ($findings -join "; ")
+    }
+  }
+}
+if ($suspiciousServices.Count -gt 0) {
+  $suspSvcCsv = Join-Path $csvDir "threat_suspicious_services.csv"
+  Export-CsvSafe -Data $suspiciousServices -Path $suspSvcCsv
+  $inventory.ThreatAnalysis.SuspiciousServices.Csv = $suspSvcCsv
+  $inventory.ThreatAnalysis.SuspiciousServices.Count = $suspiciousServices.Count
+  Write-LogEntry "Found $($suspiciousServices.Count) suspicious services" -Level "WARN"
+}
+
+# Step 22: CCDC Threat Analysis - Suspicious Scheduled Tasks
+Update-Progress "Analyzing scheduled tasks for threats..."
+Write-LogEntry "Running threat analysis on scheduled tasks"
+$suspiciousTasks = @()
+foreach ($task in $tasks) {
+  $findings = Test-SuspiciousScheduledTask -Task $task
+  if ($findings.Count -gt 0) {
+    $suspiciousTasks += [pscustomobject]@{
+      TaskName = $task.TaskName
+      TaskPath = $task.TaskPath
+      State = $task.State
+      Author = $task.Author
+      Actions = $task.Actions
+      Findings = ($findings -join "; ")
+    }
+  }
+}
+if ($suspiciousTasks.Count -gt 0) {
+  $suspTaskCsv = Join-Path $csvDir "threat_suspicious_tasks.csv"
+  Export-CsvSafe -Data $suspiciousTasks -Path $suspTaskCsv
+  $inventory.ThreatAnalysis.SuspiciousTasks.Csv = $suspTaskCsv
+  $inventory.ThreatAnalysis.SuspiciousTasks.Count = $suspiciousTasks.Count
+  Write-LogEntry "Found $($suspiciousTasks.Count) suspicious scheduled tasks" -Level "WARN"
+}
+
+# Step 23: CCDC Threat Analysis - Suspicious Network Connections
+Update-Progress "Analyzing network connections for threats..."
+Write-LogEntry "Running threat analysis on network connections"
+if ($enhancedConns.Count -gt 0) {
+  $suspConns = Get-SuspiciousNetworkConnections -Connections $enhancedConns
+  if ($suspConns.Count -gt 0) {
+    $suspConnCsv = Join-Path $csvDir "threat_suspicious_connections.csv"
+    Export-CsvSafe -Data $suspConns -Path $suspConnCsv
+    $inventory.ThreatAnalysis.SuspiciousConnections.Csv = $suspConnCsv
+    $inventory.ThreatAnalysis.SuspiciousConnections.Count = $suspConns.Count
+    Write-LogEntry "Found $($suspConns.Count) suspicious network connections" -Level "WARN"
+  }
+}
+
+# Step 24: CCDC Threat Analysis - Unauthorized Administrators
+Update-Progress "Checking for unauthorized administrators..."
+Write-LogEntry "Checking for unauthorized administrators"
+$unauthorizedAdmins = @()
+foreach ($member in $ug.GroupMembers) {
+  if (Test-UnauthorizedAdmin -GroupMember $member) {
+    $unauthorizedAdmins += $member
+  }
+}
+if ($unauthorizedAdmins.Count -gt 0) {
+  $unauthAdminCsv = Join-Path $csvDir "threat_unauthorized_admins.csv"
+  Export-CsvSafe -Data $unauthorizedAdmins -Path $unauthAdminCsv
+  $inventory.ThreatAnalysis.UnauthorizedAdmins.Csv = $unauthAdminCsv
+  $inventory.ThreatAnalysis.UnauthorizedAdmins.Count = $unauthorizedAdmins.Count
+  Write-LogEntry "Found $($unauthorizedAdmins.Count) potentially unauthorized administrators" -Level "WARN"
+}
+
+# Step 25: CCDC Security Weaknesses and Recent Modifications
+Update-Progress "Checking security configuration weaknesses..."
+Write-LogEntry "Checking security configuration weaknesses"
+$secWeaknesses = Get-SecurityWeaknesses
+if ($secWeaknesses.Count -gt 0) {
+  $weaknessCsv = Join-Path $csvDir "security_weaknesses.csv"
+  Export-CsvSafe -Data $secWeaknesses -Path $weaknessCsv
+  $inventory.ThreatAnalysis.SecurityWeaknesses.Csv = $weaknessCsv
+  $inventory.ThreatAnalysis.SecurityWeaknesses.Count = $secWeaknesses.Count
+  Write-LogEntry "Found $($secWeaknesses.Count) security weaknesses" -Level "WARN"
+
+  # Log critical weaknesses to console
+  $critical = @($secWeaknesses | Where-Object { $_.Risk -eq 'Critical' })
+  if ($critical.Count -gt 0) {
+    Write-LogEntry "CRITICAL: $($critical.Count) critical security issues found!" -Level "ERROR"
+  }
+}
+
+Write-LogEntry "Checking for recent system file modifications (last 24h)"
+$recentMods = Get-RecentFileModifications -Hours 24
+if ($recentMods -and $recentMods.Count -gt 0) {
+  $recentModCsv = Join-Path $csvDir "recent_system_modifications_24h.csv"
+  Export-CsvSafe -Data $recentMods -Path $recentModCsv
+  $inventory.ThreatAnalysis.RecentModifications.Csv = $recentModCsv
+  $inventory.ThreatAnalysis.RecentModifications.Count = $recentMods.Count
+  Write-LogEntry "Found $($recentMods.Count) recent modifications to system directories" -Level "INFO"
+}
+
+# Step 26: Additional Baseline Artifacts
 Update-Progress "Collecting baseline text artifacts..."
 Write-LogEntry "Collecting baseline text artifacts"
 $sysinfoPath = Join-Path $artDir "systeminfo.txt"
@@ -1388,6 +2317,49 @@ if ($script:ErrorLog.Count -gt 0) {
   Write-LogEntry "Encountered $($script:ErrorLog.Count) errors during collection" -Level "WARN"
 }
 
+# ---------------------------- Baseline Management ----------------------------
+
+$baselineDir = Get-BaselineDirectory -CustomPath $BaselinePath
+$baselineExists = Test-BaselineExists -BaselineDir $baselineDir
+$baselineComparison = $null
+
+if ($UpdateBaseline) {
+  # Force update baseline
+  Write-Host ""
+  Write-Host "Updating baseline at: $baselineDir" -ForegroundColor Cyan
+  $saved = Save-Baseline -BaselineDir $baselineDir -Inventory $inventory
+  if ($saved) {
+    Write-Host "Baseline updated successfully" -ForegroundColor Green
+    Write-Host ""
+  }
+} elseif ($baselineExists -and -not $SkipComparison) {
+  # Compare with existing baseline
+  Write-Host ""
+  Write-Host "Comparing with baseline at: $baselineDir" -ForegroundColor Cyan
+  $baselineComparison = Compare-WithBaseline -BaselineDir $baselineDir -CurrentInventory $inventory -ComparisonCsvDir $csvDir
+
+  if ($baselineComparison) {
+    $inventory.BaselineComparison = $baselineComparison
+
+    # Log comparison results
+    if ($baselineComparison.TotalChanges -gt 0) {
+      Write-LogEntry "Baseline comparison: $($baselineComparison.TotalChanges) changes detected since baseline" -Level "WARN"
+    } else {
+      Write-LogEntry "Baseline comparison: No changes detected" -Level "SUCCESS"
+    }
+  }
+} elseif (-not $baselineExists -and -not $SkipComparison) {
+  # No baseline exists - create one automatically
+  Write-Host ""
+  Write-Host "No baseline found - creating new baseline at: $baselineDir" -ForegroundColor Yellow
+  $saved = Save-Baseline -BaselineDir $baselineDir -Inventory $inventory
+  if ($saved) {
+    Write-Host "Baseline created successfully" -ForegroundColor Green
+    Write-Host "Future runs will compare against this baseline" -ForegroundColor Cyan
+    Write-Host ""
+  }
+}
+
 # Write JSON report
 Write-LogEntry "Writing JSON summary"
 $jsonPath = Join-Path $reportDir "inventory.json"
@@ -1406,67 +2378,139 @@ $sec = $inventory.Security
 
 $htmlStyle = @"
 <style>
-  body { 
-    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-    margin: 20px; 
-    background-color: #f5f5f5; 
+  * { box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    margin: 0;
+    padding: 0;
+    background-color: #f5f5f5;
   }
-  .header { 
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-    color: white; 
-    padding: 30px; 
-    border-radius: 10px; 
-    margin-bottom: 20px; 
+  .header {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    padding: 20px 30px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
   }
   .header h1 { margin: 0; font-size: 2em; }
   .header p { margin: 5px 0; opacity: 0.9; }
-  .section { 
-    background: white; 
-    padding: 20px; 
-    margin-bottom: 20px; 
-    border-radius: 10px; 
-    box-shadow: 0 2px 4px rgba(0,0,0,0.1); 
+
+  /* Tab Navigation */
+  .tab-nav {
+    background: white;
+    border-bottom: 2px solid #667eea;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    position: sticky;
+    top: 0;
+    z-index: 1000;
   }
-  .section h2 { 
-    color: #667eea; 
-    border-bottom: 2px solid #667eea; 
-    padding-bottom: 10px; 
-    margin-top: 0; 
+  .tab-nav ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
   }
-  table { 
-    border-collapse: collapse; 
-    width: 100%; 
-    margin-bottom: 20px; 
+  .tab-nav li {
+    flex: 0 0 auto;
   }
-  th { 
-    background-color: #667eea; 
-    color: white; 
-    padding: 12px; 
-    text-align: left; 
-    font-weight: 600; 
+  .tab-nav button {
+    background: none;
+    border: none;
+    padding: 15px 25px;
+    font-size: 1em;
+    font-weight: 600;
+    color: #666;
+    cursor: pointer;
+    border-bottom: 3px solid transparent;
+    transition: all 0.3s;
   }
-  td { 
-    padding: 10px; 
-    border-bottom: 1px solid #e0e0e0; 
+  .tab-nav button:hover {
+    background: #f8f9fa;
+    color: #667eea;
+  }
+  .tab-nav button.active {
+    color: #667eea;
+    border-bottom-color: #667eea;
+    background: #f8f9fa;
+  }
+
+  /* Tab Content */
+  .tab-content {
+    display: none;
+    padding: 20px;
+    animation: fadeIn 0.3s;
+  }
+  .tab-content.active {
+    display: block;
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  .section {
+    background: white;
+    padding: 20px;
+    margin-bottom: 20px;
+    border-radius: 10px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  }
+  .section h2 {
+    color: #667eea;
+    border-bottom: 2px solid #667eea;
+    padding-bottom: 10px;
+    margin-top: 0;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin-bottom: 20px;
+    font-size: 0.9em;
+  }
+  th {
+    background-color: #667eea;
+    color: white;
+    padding: 12px;
+    text-align: left;
+    font-weight: 600;
+    cursor: pointer;
+    user-select: none;
+    position: relative;
+  }
+  th:hover { background-color: #5568d3; }
+  th.sortable:after {
+    content: ' ⇅';
+    opacity: 0.5;
+  }
+  th.sorted-asc:after {
+    content: ' ▲';
+    opacity: 1;
+  }
+  th.sorted-desc:after {
+    content: ' ▼';
+    opacity: 1;
+  }
+  td {
+    padding: 10px;
+    border-bottom: 1px solid #e0e0e0;
   }
   tr:hover { background-color: #f8f9fa; }
-  .metric { 
-    display: inline-block; 
-    background: #f8f9fa; 
-    padding: 15px 20px; 
-    margin: 10px 10px 10px 0; 
-    border-radius: 8px; 
-    border-left: 4px solid #667eea; 
+  .metric {
+    display: inline-block;
+    background: #f8f9fa;
+    padding: 15px 20px;
+    margin: 10px 10px 10px 0;
+    border-radius: 8px;
+    border-left: 4px solid #667eea;
   }
-  .metric-label { 
-    font-size: 0.85em; 
-    color: #666; 
-    text-transform: uppercase; 
+  .metric-label {
+    font-size: 0.85em;
+    color: #666;
+    text-transform: uppercase;
   }
-  .metric-value { 
-    font-size: 1.5em; 
-    font-weight: bold; 
-    color: #333; 
+  .metric-value {
+    font-size: 1.5em;
+    font-weight: bold;
+    color: #333;
   }
   .warning { background-color: #fff3cd; border-left-color: #ffc107; }
   .danger { background-color: #f8d7da; border-left-color: #dc3545; }
@@ -1474,68 +2518,464 @@ $htmlStyle = @"
   .info { background-color: #d1ecf1; border-left-color: #17a2b8; }
   a { color: #667eea; text-decoration: none; }
   a:hover { text-decoration: underline; }
-  .footer { 
-    text-align: center; 
-    padding: 20px; 
-    color: #666; 
-    font-size: 0.9em; 
+
+  /* Data Explorer */
+  .file-browser {
+    display: grid;
+    grid-template-columns: 300px 1fr;
+    gap: 20px;
+    min-height: 500px;
+  }
+  .file-list {
+    background: white;
+    padding: 15px;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    max-height: 600px;
+    overflow-y: auto;
+  }
+  .file-item {
+    padding: 10px;
+    margin: 5px 0;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-size: 0.9em;
+  }
+  .file-item:hover {
+    background: #f8f9fa;
+  }
+  .file-item.active {
+    background: #667eea;
+    color: white;
+  }
+  .file-item .file-icon {
+    margin-right: 8px;
+  }
+  .file-viewer {
+    background: white;
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    overflow: auto;
+  }
+
+  /* Search and Filter */
+  .controls {
+    margin-bottom: 15px;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .controls input, .controls select {
+    padding: 8px 12px;
+    border: 1px solid #ddd;
+    border-radius: 5px;
+    font-size: 0.9em;
+  }
+  .controls input[type="text"] {
+    flex: 1;
+    min-width: 200px;
+  }
+  .controls button {
+    padding: 8px 16px;
+    background: #667eea;
+    color: white;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 0.9em;
+  }
+  .controls button:hover {
+    background: #5568d3;
+  }
+
+  /* Comparison View */
+  .comparison-container {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+  }
+  .comparison-panel {
+    background: white;
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  }
+
+  /* JSON Viewer */
+  .json-viewer {
+    background: #f8f9fa;
+    padding: 15px;
+    border-radius: 5px;
+    font-family: 'Courier New', monospace;
+    font-size: 0.85em;
+    max-height: 600px;
+    overflow: auto;
+  }
+
+  /* Pagination */
+  .pagination {
+    display: flex;
+    justify-content: center;
+    gap: 5px;
+    margin-top: 15px;
+  }
+  .pagination button {
+    padding: 5px 10px;
+    border: 1px solid #ddd;
+    background: white;
+    cursor: pointer;
+    border-radius: 3px;
+  }
+  .pagination button.active {
+    background: #667eea;
+    color: white;
+  }
+  .pagination button:hover:not(.active) {
+    background: #f8f9fa;
+  }
+
+  .footer {
+    text-align: center;
+    padding: 20px;
+    color: #666;
+    font-size: 0.9em;
+    background: white;
+    margin-top: 20px;
+  }
+
+  .loading {
+    text-align: center;
+    padding: 40px;
+    color: #666;
   }
 </style>
 "@
 
-$summaryMetrics = @"
-<div class="metric $(if ($sys.IsAdmin) { 'success' } else { 'warning' })">
-  <div class="metric-label">Admin Rights</div>
-  <div class="metric-value">$(if ($sys.IsAdmin) { 'YES' } else { 'NO' })</div>
-</div>
-<div class="metric">
-  <div class="metric-label">Services</div>
-  <div class="metric-value">$($inventory.Services.Count)</div>
-</div>
-<div class="metric">
-  <div class="metric-label">Processes</div>
-  <div class="metric-value">$($inventory.Processes.Count)</div>
-</div>
-<div class="metric">
-  <div class="metric-label">Scheduled Tasks</div>
-  <div class="metric-value">$($inventory.Tasks.Count)</div>
-</div>
-<div class="metric">
-  <div class="metric-label">Autoruns</div>
-  <div class="metric-value">$($inventory.Autoruns.Count)</div>
-</div>
-<div class="metric">
-  <div class="metric-label">Software</div>
-  <div class="metric-value">$($inventory.Software.Count)</div>
-</div>
-<div class="metric">
-  <div class="metric-label">Patches</div>
-  <div class="metric-value">$($inventory.Patches.Count)</div>
-</div>
-<div class="metric">
-  <div class="metric-label">Established Connections</div>
-  <div class="metric-value">$($inventory.EstablishedConnections.Count)</div>
-</div>
-"@
+$threatSummary = ""
+$totalThreats = $inventory.ThreatAnalysis.SuspiciousProcesses.Count +
+                $inventory.ThreatAnalysis.SuspiciousServices.Count +
+                $inventory.ThreatAnalysis.SuspiciousTasks.Count +
+                $inventory.ThreatAnalysis.SuspiciousConnections.Count +
+                $inventory.ThreatAnalysis.UnauthorizedAdmins.Count
+
+$criticalWeaknesses = 0
+if ($inventory.ThreatAnalysis.SecurityWeaknesses.Count -gt 0) {
+  $weaknessData = Import-Csv $inventory.ThreatAnalysis.SecurityWeaknesses.Csv -ErrorAction SilentlyContinue
+  if ($weaknessData) {
+    $criticalWeaknesses = @($weaknessData | Where-Object { $_.Risk -eq 'Critical' }).Count
+  }
+}
+
+if ($totalThreats -gt 0 -or $criticalWeaknesses -gt 0) {
+  $threatClass = if ($criticalWeaknesses -gt 0) { "danger" } elseif ($totalThreats -gt 5) { "warning" } else { "info" }
+
+  $threatMetrics = ""
+  if ($inventory.ThreatAnalysis.SuspiciousProcesses.Count -gt 0) {
+    $threatMetrics += "<div class='metric danger'><div class='metric-label'>Suspicious Processes</div><div class='metric-value'>$($inventory.ThreatAnalysis.SuspiciousProcesses.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_suspicious_processes.csv' style='color: #721c24;'>View Details</a></div></div>"
+  }
+  if ($inventory.ThreatAnalysis.SuspiciousServices.Count -gt 0) {
+    $threatMetrics += "<div class='metric danger'><div class='metric-label'>Suspicious Services</div><div class='metric-value'>$($inventory.ThreatAnalysis.SuspiciousServices.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_suspicious_services.csv' style='color: #721c24;'>View Details</a></div></div>"
+  }
+  if ($inventory.ThreatAnalysis.SuspiciousTasks.Count -gt 0) {
+    $threatMetrics += "<div class='metric danger'><div class='metric-label'>Suspicious Scheduled Tasks</div><div class='metric-value'>$($inventory.ThreatAnalysis.SuspiciousTasks.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_suspicious_tasks.csv' style='color: #721c24;'>View Details</a></div></div>"
+  }
+  if ($inventory.ThreatAnalysis.SuspiciousConnections.Count -gt 0) {
+    $threatMetrics += "<div class='metric danger'><div class='metric-label'>Suspicious Network Connections</div><div class='metric-value'>$($inventory.ThreatAnalysis.SuspiciousConnections.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_suspicious_connections.csv' style='color: #721c24;'>View Details</a></div></div>"
+  }
+  if ($inventory.ThreatAnalysis.UnauthorizedAdmins.Count -gt 0) {
+    $threatMetrics += "<div class='metric danger'><div class='metric-label'>Unauthorized Admins</div><div class='metric-value'>$($inventory.ThreatAnalysis.UnauthorizedAdmins.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/threat_unauthorized_admins.csv' style='color: #721c24;'>View Details</a></div></div>"
+  }
+  if ($criticalWeaknesses -gt 0) {
+    $threatMetrics += "<div class='metric danger'><div class='metric-label'>Critical Security Issues</div><div class='metric-value'>$criticalWeaknesses</div><div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/security_weaknesses.csv' style='color: #721c24;'>View Details</a></div></div>"
+  }
+  if ($inventory.ThreatAnalysis.RecentModifications.Count -gt 0) {
+    $threatMetrics += "<div class='metric warning'><div class='metric-label'>Recent System File Changes (24h)</div><div class='metric-value'>$($inventory.ThreatAnalysis.RecentModifications.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'><a href='csv/recent_system_modifications_24h.csv' style='color: #856404;'>View Details</a></div></div>"
+  }
+
+  $threatSummary = "<div class='section $threatClass'><h2>[!] CCDC THREAT ANALYSIS - IMMEDIATE ATTENTION REQUIRED</h2><div style='font-size: 1.2em; margin: 15px 0;'><strong>Total Suspicious Items: $totalThreats</strong> | <strong>Critical Security Issues: $criticalWeaknesses</strong></div><div style='display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-top: 20px;'>$threatMetrics</div><div style='margin-top: 20px; padding: 15px; background: rgba(255,255,255,0.3); border-radius: 5px;'><strong>Next Steps:</strong><ol style='margin: 10px 0;'><li>Review all suspicious items in the CSV files linked above</li><li>Investigate processes, services, and tasks running from unusual locations</li><li>Verify all network connections, especially to uncommon ports</li><li>Check unauthorized administrators and remove if needed</li><li>Address critical security weaknesses immediately (Defender, Firewall, UAC)</li><li>Review recent system file modifications for unauthorized changes</li></ol></div></div>"
+}
+
+# Generate baseline comparison section
+$baselineSection = ""
+if ($baselineComparison) {
+  $baselineDate = try { ([datetime]$baselineComparison.BaselineDate).ToString("yyyy-MM-dd HH:mm") } catch { "Unknown" }
+  $totalChanges = $baselineComparison.TotalChanges
+
+  $changeClass = if ($baselineComparison.Admins.Count -gt 0) { "danger" } elseif ($totalChanges -gt 10) { "warning" } elseif ($totalChanges -gt 0) { "info" } else { "success" }
+
+  $changeMetrics = ""
+
+  # Processes
+  if ($baselineComparison.Processes.Count -gt 0) {
+    $addedCount = $baselineComparison.Processes.Added.Count
+    $removedCount = $baselineComparison.Processes.Removed.Count
+    $csvLink = if ($baselineComparison.Processes.Csv) { $baselineComparison.Processes.Csv.Replace($reportDir + "\", "") } else { "" }
+    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Processes Changed</div><div class='metric-value'>$($baselineComparison.Processes.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount<br/><a href='$csvLink' style='color: #856404;'>View Details</a></div></div>"
+  }
+
+  # Services
+  if ($baselineComparison.Services.Count -gt 0) {
+    $addedCount = $baselineComparison.Services.Added.Count
+    $removedCount = $baselineComparison.Services.Removed.Count
+    $csvLink = if ($baselineComparison.Services.Csv) { $baselineComparison.Services.Csv.Replace($reportDir + "\", "") } else { "" }
+    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Services Changed</div><div class='metric-value'>$($baselineComparison.Services.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount<br/><a href='$csvLink' style='color: #856404;'>View Details</a></div></div>"
+  }
+
+  # Scheduled Tasks
+  if ($baselineComparison.Tasks.Count -gt 0) {
+    $addedCount = $baselineComparison.Tasks.Added.Count
+    $removedCount = $baselineComparison.Tasks.Removed.Count
+    $csvLink = if ($baselineComparison.Tasks.Csv) { $baselineComparison.Tasks.Csv.Replace($reportDir + "\", "") } else { "" }
+    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Tasks Changed</div><div class='metric-value'>$($baselineComparison.Tasks.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount<br/><a href='$csvLink' style='color: #856404;'>View Details</a></div></div>"
+  }
+
+  # Users
+  if ($baselineComparison.Users.Count -gt 0) {
+    $addedCount = $baselineComparison.Users.Added.Count
+    $removedCount = $baselineComparison.Users.Removed.Count
+    $csvLink = if ($baselineComparison.Users.Csv) { $baselineComparison.Users.Csv.Replace($reportDir + "\", "") } else { "" }
+    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Users Changed</div><div class='metric-value'>$($baselineComparison.Users.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount<br/><a href='$csvLink' style='color: #856404;'>View Details</a></div></div>"
+  }
+
+  # Administrators (HIGH PRIORITY)
+  if ($baselineComparison.Admins.Count -gt 0) {
+    $addedCount = $baselineComparison.Admins.Added.Count
+    $removedCount = $baselineComparison.Admins.Removed.Count
+    $csvLink = if ($baselineComparison.Admins.Csv) { $baselineComparison.Admins.Csv.Replace($reportDir + "\", "") } else { "" }
+    $changeMetrics += "<div class='metric danger'><div class='metric-label'>ADMINS Changed</div><div class='metric-value'>$($baselineComparison.Admins.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount<br/><a href='$csvLink' style='color: #721c24;'>View Details</a></div></div>"
+  }
+
+  # Software
+  if ($baselineComparison.Software.Count -gt 0) {
+    $addedCount = $baselineComparison.Software.Added.Count
+    $removedCount = $baselineComparison.Software.Removed.Count
+    $csvLink = if ($baselineComparison.Software.Csv) { $baselineComparison.Software.Csv.Replace($reportDir + "\", "") } else { "" }
+    $changeMetrics += "<div class='metric info'><div class='metric-label'>Software Changed</div><div class='metric-value'>$($baselineComparison.Software.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount<br/><a href='$csvLink' style='color: #0c5460;'>View Details</a></div></div>"
+  }
+
+  # Autoruns
+  if ($baselineComparison.Autoruns.Count -gt 0) {
+    $addedCount = $baselineComparison.Autoruns.Added.Count
+    $removedCount = $baselineComparison.Autoruns.Removed.Count
+    $csvLink = if ($baselineComparison.Autoruns.Csv) { $baselineComparison.Autoruns.Csv.Replace($reportDir + "\", "") } else { "" }
+    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Autoruns Changed</div><div class='metric-value'>$($baselineComparison.Autoruns.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount<br/><a href='$csvLink' style='color: #856404;'>View Details</a></div></div>"
+  }
+
+  # Shares
+  if ($baselineComparison.Shares.Count -gt 0) {
+    $addedCount = $baselineComparison.Shares.Added.Count
+    $removedCount = $baselineComparison.Shares.Removed.Count
+    $csvLink = if ($baselineComparison.Shares.Csv) { $baselineComparison.Shares.Csv.Replace($reportDir + "\", "") } else { "" }
+    $changeMetrics += "<div class='metric warning'><div class='metric-label'>Shares Changed</div><div class='metric-value'>$($baselineComparison.Shares.Count)</div><div style='font-size: 0.8em; margin-top: 5px;'>+$addedCount / -$removedCount<br/><a href='$csvLink' style='color: #856404;'>View Details</a></div></div>"
+  }
+
+  $statusText = if ($totalChanges -eq 0) {
+    "<div style='font-size: 1.2em; margin: 15px 0; color: #28a745;'><strong>[OK] No changes detected since baseline</strong></div>"
+  } else {
+    "<div style='font-size: 1.2em; margin: 15px 0;'><strong>Total Changes: $totalChanges</strong></div>"
+  }
+
+  # Generate detailed change tables
+  $detailedChanges = ""
+
+  # Helper function to create change table HTML
+  function Get-ChangeTableHtml {
+    param(
+      [string]$CategoryName,
+      [string]$CsvPath,
+      [array]$AddedItems,
+      [array]$RemovedItems,
+      [string]$IconColor = "#856404"
+    )
+
+    if (-not $CsvPath -or -not (Test-Path $CsvPath)) {
+      return ""
+    }
+
+    try {
+      $changeData = Import-Csv $CsvPath
+      if ($changeData.Count -eq 0) { return "" }
+
+      $html = "<details style='margin: 20px 0; border: 1px solid #ddd; border-radius: 5px; padding: 10px; background: rgba(255,255,255,0.5);'>"
+      $html += "<summary style='cursor: pointer; font-weight: bold; font-size: 1.1em; color: $IconColor; padding: 5px;'>&#9658; $CategoryName Changes ($($changeData.Count) total: +$($AddedItems.Count) / -$($RemovedItems.Count))</summary>"
+      $html += "<div style='margin-top: 15px;'>"
+
+      # Added items section
+      if ($AddedItems.Count -gt 0) {
+        $html += "<div style='margin-bottom: 20px;'>"
+        $html += "<h4 style='color: #28a745; margin-bottom: 10px;'>&#10133; Added ($($AddedItems.Count))</h4>"
+        $html += "<div style='overflow-x: auto;'><table style='width: 100%; border-collapse: collapse; font-size: 0.9em;'>"
+
+        # Get column headers from first added item
+        $addedData = $changeData | Where-Object { $_.Change -eq "ADDED" }
+        if ($addedData.Count -gt 0) {
+          $columns = ($addedData | Select-Object -First 1).PSObject.Properties.Name | Where-Object { $_ -ne "Change" }
+          $html += "<thead><tr style='background: #d4edda; border-bottom: 2px solid #28a745;'>"
+          foreach ($col in $columns) {
+            $html += "<th style='padding: 8px; text-align: left; border: 1px solid #c3e6cb;'>$col</th>"
+          }
+          $html += "</tr></thead><tbody>"
+
+          foreach ($row in $addedData) {
+            $html += "<tr style='border-bottom: 1px solid #d4edda;'>"
+            foreach ($col in $columns) {
+              $value = $row.$col
+              if ([string]::IsNullOrWhiteSpace($value)) { $value = "-" }
+              $displayValue = if ($value.Length -gt 80) { $value.Substring(0, 77) + "..." } else { $value }
+              $html += "<td style='padding: 6px 8px; border: 1px solid #d4edda;' title='$([System.Web.HttpUtility]::HtmlEncode($value))'>$([System.Web.HttpUtility]::HtmlEncode($displayValue))</td>"
+            }
+            $html += "</tr>"
+          }
+          $html += "</tbody>"
+        }
+        $html += "</table></div></div>"
+      }
+
+      # Removed items section
+      if ($RemovedItems.Count -gt 0) {
+        $html += "<div style='margin-bottom: 10px;'>"
+        $html += "<h4 style='color: #dc3545; margin-bottom: 10px;'>&#10134; Removed ($($RemovedItems.Count))</h4>"
+        $html += "<div style='overflow-x: auto;'><table style='width: 100%; border-collapse: collapse; font-size: 0.9em;'>"
+
+        # Get column headers from first removed item
+        $removedData = $changeData | Where-Object { $_.Change -eq "REMOVED" }
+        if ($removedData.Count -gt 0) {
+          $columns = ($removedData | Select-Object -First 1).PSObject.Properties.Name | Where-Object { $_ -ne "Change" }
+          $html += "<thead><tr style='background: #f8d7da; border-bottom: 2px solid #dc3545;'>"
+          foreach ($col in $columns) {
+            $html += "<th style='padding: 8px; text-align: left; border: 1px solid #f5c6cb;'>$col</th>"
+          }
+          $html += "</tr></thead><tbody>"
+
+          foreach ($row in $removedData) {
+            $html += "<tr style='border-bottom: 1px solid #f8d7da;'>"
+            foreach ($col in $columns) {
+              $value = $row.$col
+              if ([string]::IsNullOrWhiteSpace($value)) { $value = "-" }
+              $displayValue = if ($value.Length -gt 80) { $value.Substring(0, 77) + "..." } else { $value }
+              $html += "<td style='padding: 6px 8px; border: 1px solid #f8d7da;' title='$([System.Web.HttpUtility]::HtmlEncode($value))'>$([System.Web.HttpUtility]::HtmlEncode($displayValue))</td>"
+            }
+            $html += "</tr>"
+          }
+          $html += "</tbody>"
+        }
+        $html += "</table></div></div>"
+      }
+
+      $csvRelPath = $CsvPath.Replace($reportDir + "\", "")
+      $html += "<div style='margin-top: 10px; text-align: right;'><a href='$csvRelPath' style='color: $IconColor; text-decoration: none;'>&#128190; Download Full CSV</a></div>"
+      $html += "</div></details>"
+
+      return $html
+    } catch {
+      return ""
+    }
+  }
+
+  # Add System.Web assembly for HTML encoding
+  Add-Type -AssemblyName System.Web
+
+  # Generate detailed tables for each category
+  if ($baselineComparison.Processes.Count -gt 0) {
+    $detailedChanges += Get-ChangeTableHtml -CategoryName "Processes" -CsvPath $baselineComparison.Processes.Csv -AddedItems $baselineComparison.Processes.Added -RemovedItems $baselineComparison.Processes.Removed -IconColor "#856404"
+  }
+
+  if ($baselineComparison.Services.Count -gt 0) {
+    $detailedChanges += Get-ChangeTableHtml -CategoryName "Services" -CsvPath $baselineComparison.Services.Csv -AddedItems $baselineComparison.Services.Added -RemovedItems $baselineComparison.Services.Removed -IconColor "#856404"
+  }
+
+  if ($baselineComparison.Tasks.Count -gt 0) {
+    $detailedChanges += Get-ChangeTableHtml -CategoryName "Scheduled Tasks" -CsvPath $baselineComparison.Tasks.Csv -AddedItems $baselineComparison.Tasks.Added -RemovedItems $baselineComparison.Tasks.Removed -IconColor "#856404"
+  }
+
+  if ($baselineComparison.Users.Count -gt 0) {
+    $detailedChanges += Get-ChangeTableHtml -CategoryName "Users" -CsvPath $baselineComparison.Users.Csv -AddedItems $baselineComparison.Users.Added -RemovedItems $baselineComparison.Users.Removed -IconColor "#856404"
+  }
+
+  if ($baselineComparison.Admins.Count -gt 0) {
+    $detailedChanges += Get-ChangeTableHtml -CategoryName "ADMINISTRATORS" -CsvPath $baselineComparison.Admins.Csv -AddedItems $baselineComparison.Admins.Added -RemovedItems $baselineComparison.Admins.Removed -IconColor "#721c24"
+  }
+
+  if ($baselineComparison.Software.Count -gt 0) {
+    $detailedChanges += Get-ChangeTableHtml -CategoryName "Software" -CsvPath $baselineComparison.Software.Csv -AddedItems $baselineComparison.Software.Added -RemovedItems $baselineComparison.Software.Removed -IconColor "#0c5460"
+  }
+
+  if ($baselineComparison.Autoruns.Count -gt 0) {
+    $detailedChanges += Get-ChangeTableHtml -CategoryName "Autoruns" -CsvPath $baselineComparison.Autoruns.Csv -AddedItems $baselineComparison.Autoruns.Added -RemovedItems $baselineComparison.Autoruns.Removed -IconColor "#856404"
+  }
+
+  if ($baselineComparison.Shares.Count -gt 0) {
+    $detailedChanges += Get-ChangeTableHtml -CategoryName "Network Shares" -CsvPath $baselineComparison.Shares.Csv -AddedItems $baselineComparison.Shares.Added -RemovedItems $baselineComparison.Shares.Removed -IconColor "#856404"
+  }
+
+  $baselineSection = "<div class='section $changeClass'><h2>BASELINE COMPARISON (since $baselineDate)</h2>$statusText<div style='display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-top: 20px;'>$changeMetrics</div>$detailedChanges</div>"
+}
+
+# Ensure $sys and $sec are valid with default properties
+if (-not $sys) {
+  $sys = [pscustomobject]@{
+    ComputerName = $env:COMPUTERNAME
+    Domain = $null
+    PartOfDomain = $false
+    Manufacturer = $null
+    Model = $null
+    OSName = $null
+    OSVersion = $null
+    OSBuildNumber = $null
+    OSArchitecture = $null
+    InstallDate = $null
+    LastBootUpTime = $null
+    UptimeHours = $null
+    BIOSVersion = $null
+    BIOSSerial = $null
+    CPUName = $null
+    CPUCores = $null
+    CPULogicalProcessors = $null
+    TotalMemoryGB = $null
+    IsAdmin = $false
+    TimeCollected = (Get-Date).ToString("o")
+  }
+}
+
+if (-not $sec) {
+  $sec = [pscustomobject]@{
+    UAC = [pscustomobject]@{ EnableLUA = $null }
+    RDP_DenyTSConnections = $null
+  }
+}
+
+$adminClass = if ($sys.IsAdmin) { 'success' } else { 'warning' }
+$adminText = if ($sys.IsAdmin) { 'YES' } else { 'NO' }
+$summaryMetrics = "<div class='metric $adminClass'><div class='metric-label'>Admin Rights</div><div class='metric-value'>$adminText</div></div>"
+$summaryMetrics += "<div class='metric'><div class='metric-label'>Services</div><div class='metric-value'>$($inventory.Services.Count)</div></div>"
+$summaryMetrics += "<div class='metric'><div class='metric-label'>Processes</div><div class='metric-value'>$($inventory.Processes.Count)</div></div>"
+$summaryMetrics += "<div class='metric'><div class='metric-label'>Scheduled Tasks</div><div class='metric-value'>$($inventory.Tasks.Count)</div></div>"
+$summaryMetrics += "<div class='metric'><div class='metric-label'>Autoruns</div><div class='metric-value'>$($inventory.Autoruns.Count)</div></div>"
+$summaryMetrics += "<div class='metric'><div class='metric-label'>Software</div><div class='metric-value'>$($inventory.Software.Count)</div></div>"
+$summaryMetrics += "<div class='metric'><div class='metric-label'>Patches</div><div class='metric-value'>$($inventory.Patches.Count)</div></div>"
+$summaryMetrics += "<div class='metric'><div class='metric-label'>Established Connections</div><div class='metric-value'>$($inventory.EstablishedConnections.Count)</div></div>"
 
 $summaryTable = @(
-  [pscustomobject]@{ Category="System"; Key="Computer Name"; Value=$sys.ComputerName },
-  [pscustomobject]@{ Category="System"; Key="Domain"; Value=$sys.Domain },
-  [pscustomobject]@{ Category="System"; Key="Part of Domain"; Value=$sys.PartOfDomain },
+  [pscustomobject]@{ Category="System"; Key="Computer Name"; Value=($sys.ComputerName) },
+  [pscustomobject]@{ Category="System"; Key="Domain"; Value=($sys.Domain) },
+  [pscustomobject]@{ Category="System"; Key="Part of Domain"; Value=($sys.PartOfDomain) },
   [pscustomobject]@{ Category="System"; Key="Operating System"; Value=("$($sys.OSName) ($($sys.OSArchitecture))") },
   [pscustomobject]@{ Category="System"; Key="OS Version/Build"; Value=("$($sys.OSVersion) / $($sys.OSBuildNumber)") },
-  [pscustomobject]@{ Category="System"; Key="Last Boot"; Value=$sys.LastBootUpTime },
-  [pscustomobject]@{ Category="System"; Key="Uptime (Hours)"; Value=$sys.UptimeHours },
+  [pscustomobject]@{ Category="System"; Key="Last Boot"; Value=($sys.LastBootUpTime) },
+  [pscustomobject]@{ Category="System"; Key="Uptime (Hours)"; Value=($sys.UptimeHours) },
   [pscustomobject]@{ Category="Hardware"; Key="Manufacturer/Model"; Value=("$($sys.Manufacturer) / $($sys.Model)") },
-  [pscustomobject]@{ Category="Hardware"; Key="CPU"; Value=$sys.CPUName },
-  [pscustomobject]@{ Category="Hardware"; Key="CPU Cores"; Value=$sys.CPUCores },
-  [pscustomobject]@{ Category="Hardware"; Key="RAM (GB)"; Value=$sys.TotalMemoryGB },
-  [pscustomobject]@{ Category="Security"; Key="UAC Enabled"; Value=$sec.UAC.EnableLUA },
-  [pscustomobject]@{ Category="Security"; Key="RDP Denied"; Value=$sec.RDP_DenyTSConnections },
-  [pscustomobject]@{ Category="Network"; Key="TCP Connections"; Value=$inventory.Ports.TcpCount },
-  [pscustomobject]@{ Category="Network"; Key="UDP Endpoints"; Value=$inventory.Ports.UdpCount },
-  [pscustomobject]@{ Category="Inventory"; Key="Network Shares"; Value=$inventory.Shares.Count },
-  [pscustomobject]@{ Category="Inventory"; Key="Certificates"; Value=$inventory.Certs.Count }
+  [pscustomobject]@{ Category="Hardware"; Key="CPU"; Value=($sys.CPUName) },
+  [pscustomobject]@{ Category="Hardware"; Key="CPU Cores"; Value=($sys.CPUCores) },
+  [pscustomobject]@{ Category="Hardware"; Key="RAM (GB)"; Value=($sys.TotalMemoryGB) },
+  [pscustomobject]@{ Category="Security"; Key="UAC Enabled"; Value=($sec.UAC.EnableLUA) },
+  [pscustomobject]@{ Category="Security"; Key="RDP Denied"; Value=($sec.RDP_DenyTSConnections) },
+  [pscustomobject]@{ Category="Network"; Key="TCP Connections"; Value=($inventory.Ports.TcpCount) },
+  [pscustomobject]@{ Category="Network"; Key="UDP Endpoints"; Value=($inventory.Ports.UdpCount) },
+  [pscustomobject]@{ Category="Inventory"; Key="Network Shares"; Value=($inventory.Shares.Count) },
+  [pscustomobject]@{ Category="Inventory"; Key="Certificates"; Value=($inventory.Certs.Count) }
 )
 
 $summaryHtml = $summaryTable | ConvertTo-Html -Property Category, Key, Value -Fragment
@@ -1550,55 +2990,182 @@ $artifactLinks += "</ul>"
 
 $errorSection = ""
 if ($inventory.Metadata.ErrorCount -gt 0) {
-  $errorSection = @"
-<div class="section danger">
-  <h2>⚠ Collection Errors ($($inventory.Metadata.ErrorCount))</h2>
-  <p>Some data collection operations encountered errors. See <a href="csv/collection_errors.csv">collection_errors.csv</a> for details.</p>
-</div>
-"@
+  $errorSection = "<div class='section danger'><h2>[!] Collection Errors ($($inventory.Metadata.ErrorCount))</h2><p>Some data collection operations encountered errors. See <a href='csv/collection_errors.csv'>collection_errors.csv</a> for details.</p></div>"
 }
 
-$htmlContent = @"
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <title>Windows Inventory Report - $($sys.ComputerName)</title>
-  $htmlStyle
-</head>
-<body>
-  <div class="header">
-    <h1>🖥 Windows Inventory Report</h1>
-    <p><b>Computer:</b> $($sys.ComputerName) | <b>Collected:</b> $($inventory.Metadata.CollectedAt)</p>
-    <p><b>Duration:</b> $($inventory.Metadata.ExecutionTime.DurationSeconds)s | <b>Quick Mode:</b> $($inventory.Metadata.QuickMode)</p>
-  </div>
+# Build JavaScript for interactive features
+$javaScript = @'
+<script>
+function switchTab(tabName, button) {
+  var tabs = document.getElementsByClassName('tab-content');
+  for (var i = 0; i < tabs.length; i++) {
+    tabs[i].classList.remove('active');
+  }
+  var buttons = document.querySelectorAll('.tab-nav button');
+  for (var j = 0; j < buttons.length; j++) {
+    buttons[j].classList.remove('active');
+  }
+  document.getElementById(tabName).classList.add('active');
+  button.classList.add('active');
 
-  $errorSection
+  if (tabName === 'data-explorer' && !window.explorerLoaded) {
+    loadDataExplorer();
+    window.explorerLoaded = true;
+  }
+}
 
-  <div class="section">
-    <h2>📊 Summary Metrics</h2>
-    $summaryMetrics
-  </div>
+function loadDataExplorer() {
+  var fileList = document.getElementById('file-list');
+  var html = '<h4 style="margin-bottom: 10px;">Available Files</h4>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/processes.csv\', \'Processes\')">📊 processes.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/services.csv\', \'Services\')">📊 services.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/scheduled_tasks.csv\', \'Scheduled Tasks\')">📊 scheduled_tasks.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/users.csv\', \'Users\')">📊 users.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/group_members.csv\', \'Group Members\')">📊 group_members.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/software.csv\', \'Software\')">📊 software.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/patches.csv\', \'Patches\')">📊 patches.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/autoruns.csv\', \'Autoruns\')">📊 autoruns.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/network_connections_enhanced.csv\', \'Network Connections\')">📊 network_connections.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/listening_ports.csv\', \'Listening Ports\')">📊 listening_ports.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/shares.csv\', \'Shares\')">📊 shares.csv</div>';
+  html += '<div class="file-item" onclick="loadCSV(\'csv/firewall_rules.csv\', \'Firewall Rules\')">📊 firewall_rules.csv</div>';
+  html += '<div class="file-item" onclick="loadJSON(\'inventory.json\', \'Inventory JSON\')">📄 inventory.json</div>';
+  fileList.innerHTML = html;
+}
 
-  <div class="section">
-    <h2>📋 System Details</h2>
-    $summaryHtml
-  </div>
+function loadCSV(path, name) {
+  var viewer = document.getElementById('file-viewer');
+  viewer.innerHTML = '<div class="loading">Loading ' + name + '...</div>';
 
-  <div class="section">
-    <h2>📁 Artifacts & Reports</h2>
-    <p><b>JSON Summary:</b> <a href="inventory.json">inventory.json</a></p>
-    <p><b>Collection Log:</b> <a href="collection.log">collection.log</a></p>
-    $artifactLinks
-  </div>
+  fetch(path)
+    .then(function(response) { return response.text(); })
+    .then(function(text) {
+      var lines = text.split('\n');
+      if (lines.length === 0) {
+        viewer.innerHTML = '<p>No data in file</p>';
+        return;
+      }
 
-  <div class="footer">
-    <p>Generated by Get-WindowsInventory.ps1 v2.0</p>
-    <p>Report Directory: $reportDir</p>
-  </div>
-</body>
-</html>
-"@
+      var html = '<h3>' + name + '</h3>';
+      html += '<div style="overflow-x: auto;"><table><thead><tr>';
+
+      var headers = lines[0].split(',');
+      for (var i = 0; i < headers.length; i++) {
+        html += '<th>' + headers[i].replace(/"/g, '') + '</th>';
+      }
+      html += '</tr></thead><tbody>';
+
+      var maxRows = Math.min(lines.length, 101);
+      for (var j = 1; j < maxRows; j++) {
+        if (!lines[j].trim()) continue;
+        html += '<tr>';
+        var cells = lines[j].split(',');
+        for (var k = 0; k < cells.length; k++) {
+          var val = cells[k].replace(/"/g, '');
+          if (val.length > 80) val = val.substring(0, 77) + '...';
+          html += '<td>' + val + '</td>';
+        }
+        html += '</tr>';
+      }
+      html += '</tbody></table></div>';
+      if (lines.length > 101) {
+        html += '<p style="margin-top: 10px; color: #666;">Showing first 100 rows. Download CSV for full data.</p>';
+      }
+      viewer.innerHTML = html;
+    })
+    .catch(function(err) {
+      viewer.innerHTML = '<p style="color: #dc3545;">Error loading file: ' + err.message + '</p>';
+    });
+}
+
+function loadJSON(path, name) {
+  var viewer = document.getElementById('file-viewer');
+  viewer.innerHTML = '<div class="loading">Loading ' + name + '...</div>';
+
+  fetch(path)
+    .then(function(response) { return response.text(); })
+    .then(function(text) {
+      try {
+        var json = JSON.parse(text);
+        var formatted = JSON.stringify(json, null, 2);
+        viewer.innerHTML = '<h3>' + name + '</h3><div class="json-viewer"><pre>' + formatted + '</pre></div>';
+      } catch (e) {
+        viewer.innerHTML = '<p style="color: #dc3545;">Error parsing JSON: ' + e.message + '</p>';
+      }
+    })
+    .catch(function(err) {
+      viewer.innerHTML = '<p style="color: #dc3545;">Error loading file: ' + err.message + '</p>';
+    });
+}
+</script>
+'@
+
+$htmlContent = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Windows Inventory Report - $($sys.ComputerName)</title>$htmlStyle$javaScript</head><body>"
+$htmlContent += "<div class='header'><h1>Windows Inventory Report - CCDC Edition</h1>"
+$htmlContent += "<p><b>Computer:</b> $($sys.ComputerName) | <b>Collected:</b> $($inventory.Metadata.CollectedAt)</p>"
+$htmlContent += "<p><b>Duration:</b> $($inventory.Metadata.ExecutionTime.DurationSeconds)s | <b>Quick Mode:</b> $($inventory.Metadata.QuickMode)</p></div>"
+
+# Tab Navigation
+$htmlContent += "<nav class='tab-nav'><ul>"
+$htmlContent += "<li><button onclick=""switchTab('dashboard', this)"" class='active'>Dashboard</button></li>"
+$htmlContent += "<li><button onclick=""switchTab('baseline-comparison', this)"">Baseline Comparison</button></li>"
+$htmlContent += "<li><button onclick=""switchTab('data-explorer', this)"">Data Explorer</button></li>"
+$htmlContent += "<li><button onclick=""switchTab('report-comparison', this)"">Report Comparison</button></li>"
+$htmlContent += "</ul></nav>"
+
+# Tab 1: Dashboard
+$htmlContent += "<div id='dashboard' class='tab-content active'>"
+$htmlContent += $errorSection
+$htmlContent += $threatSummary
+$htmlContent += "<div class='section'><h2>Summary Metrics</h2>$summaryMetrics</div>"
+$htmlContent += "<div class='section'><h2>System Details</h2>$summaryHtml</div>"
+$htmlContent += "<div class='section'><h2>Artifacts &amp; Reports</h2>"
+$htmlContent += "<p><b>JSON Summary:</b> <a href='inventory.json'>inventory.json</a></p>"
+$htmlContent += "<p><b>Collection Log:</b> <a href='collection.log'>collection.log</a></p>"
+$htmlContent += $artifactLinks
+$htmlContent += "</div></div>"
+
+# Tab 2: Baseline Comparison
+$htmlContent += "<div id='baseline-comparison' class='tab-content'>"
+$htmlContent += $baselineSection
+if (-not $baselineSection) {
+  $htmlContent += "<div class='section info'><h2>Baseline Comparison</h2><p>No baseline comparison available. Run the script to create or compare with baseline.</p></div>"
+}
+$htmlContent += "</div>"
+
+# Tab 3: Data Explorer
+$htmlContent += "<div id='data-explorer' class='tab-content'>"
+$htmlContent += "<div class='section'><h2>Data Explorer</h2>"
+$htmlContent += "<p>Browse and view all CSV and JSON files generated during inventory collection. Click any file to view its contents in an interactive, searchable table.</p>"
+$htmlContent += "<div class='file-browser'>"
+$htmlContent += "<div id='file-list' class='file-list'></div>"
+$htmlContent += "<div id='file-viewer' class='file-viewer'><p>Select a file from the list to view its contents</p></div>"
+$htmlContent += "</div></div></div>"
+
+# Tab 4: Report Comparison
+$htmlContent += "<div id='report-comparison' class='tab-content'>"
+$htmlContent += "<div class='section'><h2>Report Comparison</h2>"
+$htmlContent += "<p>Compare data between this report and another inventory report. Enter the folder name of another report (relative to parent directory).</p>"
+$htmlContent += "<div class='controls'>"
+$htmlContent += "<input type='text' id='comparison-folder' placeholder='e.g., System_Inventory_2024-01-15_10-30-00' style='flex: 2;'>"
+$htmlContent += "<select id='comparison-category' style='flex: 1;'>"
+$htmlContent += "<option value='processes'>Processes</option>"
+$htmlContent += "<option value='services'>Services</option>"
+$htmlContent += "<option value='scheduled_tasks'>Scheduled Tasks</option>"
+$htmlContent += "<option value='users'>Users</option>"
+$htmlContent += "<option value='software'>Software</option>"
+$htmlContent += "<option value='autoruns'>Autoruns</option>"
+$htmlContent += "<option value='network_connections_enhanced'>Network Connections</option>"
+$htmlContent += "</select>"
+$htmlContent += "<button onclick='compareReports()'>Compare</button>"
+$htmlContent += "</div>"
+$htmlContent += "<div id='comparison-viewer' style='margin-top: 20px;'></div>"
+$htmlContent += "</div></div>"
+
+$htmlContent += "<div class='footer'><p>Generated by Get-WindowsInventory.ps1 v2.2 (CCDC Enhanced Edition with Interactive Report Viewer)</p>"
+$htmlContent += "<p>Report Directory: $reportDir</p>"
+$htmlContent += "<p style='margin-top: 10px; font-size: 0.9em;'><strong>CCDC Features:</strong> Automated threat detection, suspicious activity flagging, security weakness identification, baseline comparison, interactive data exploration, and report comparison.</p>"
+$htmlContent += "</div></body></html>"
 
 try {
   $htmlContent | Out-File -FilePath $htmlPath -Encoding UTF8 -Force
@@ -1665,4 +3232,212 @@ if ($inventory.Metadata.ErrorCount -gt 0) {
   Write-Host "Errors encountered: $($inventory.Metadata.ErrorCount) (see collection.log)" -ForegroundColor Red
 }
 
+Write-Host ""
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "  CCDC THREAT ANALYSIS SUMMARY" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+
+$totalThreatsConsole = $inventory.ThreatAnalysis.SuspiciousProcesses.Count +
+                       $inventory.ThreatAnalysis.SuspiciousServices.Count +
+                       $inventory.ThreatAnalysis.SuspiciousTasks.Count +
+                       $inventory.ThreatAnalysis.SuspiciousConnections.Count +
+                       $inventory.ThreatAnalysis.UnauthorizedAdmins.Count
+
+if ($totalThreatsConsole -gt 0) {
+  Write-Host ""
+  Write-Host "[!] THREATS DETECTED: $totalThreatsConsole suspicious items found" -ForegroundColor Red
+  Write-Host ""
+
+  if ($inventory.ThreatAnalysis.SuspiciousProcesses.Count -gt 0) {
+    Write-Host "  [!] Suspicious Processes: $($inventory.ThreatAnalysis.SuspiciousProcesses.Count)" -ForegroundColor Yellow
+  }
+  if ($inventory.ThreatAnalysis.SuspiciousServices.Count -gt 0) {
+    Write-Host "  [!] Suspicious Services: $($inventory.ThreatAnalysis.SuspiciousServices.Count)" -ForegroundColor Yellow
+  }
+  if ($inventory.ThreatAnalysis.SuspiciousTasks.Count -gt 0) {
+    Write-Host "  [!] Suspicious Scheduled Tasks: $($inventory.ThreatAnalysis.SuspiciousTasks.Count)" -ForegroundColor Yellow
+  }
+  if ($inventory.ThreatAnalysis.SuspiciousConnections.Count -gt 0) {
+    Write-Host "  [!] Suspicious Network Connections: $($inventory.ThreatAnalysis.SuspiciousConnections.Count)" -ForegroundColor Yellow
+  }
+  if ($inventory.ThreatAnalysis.UnauthorizedAdmins.Count -gt 0) {
+    Write-Host "  [!] Potentially Unauthorized Admins: $($inventory.ThreatAnalysis.UnauthorizedAdmins.Count)" -ForegroundColor Yellow
+  }
+} else {
+  Write-Host ""
+  Write-Host "[OK] No immediate threats detected" -ForegroundColor Green
+}
+
+if ($inventory.ThreatAnalysis.SecurityWeaknesses.Count -gt 0) {
+  Write-Host ""
+  Write-Host "[!] SECURITY WEAKNESSES: $($inventory.ThreatAnalysis.SecurityWeaknesses.Count) configuration issues found" -ForegroundColor Yellow
+
+  # Show critical weaknesses
+  if (Test-Path $inventory.ThreatAnalysis.SecurityWeaknesses.Csv) {
+    $weaknessData = Import-Csv $inventory.ThreatAnalysis.SecurityWeaknesses.Csv
+    $criticalIssues = $weaknessData | Where-Object { $_.Risk -eq 'Critical' }
+    if ($criticalIssues) {
+      Write-Host ""
+      Write-Host "  CRITICAL ISSUES:" -ForegroundColor Red
+      foreach ($issue in $criticalIssues) {
+        Write-Host "    * $($issue.Issue)" -ForegroundColor Red
+        Write-Host "      > $($issue.Recommendation)" -ForegroundColor White
+      }
+    }
+  }
+}
+
+if ($inventory.ThreatAnalysis.RecentModifications.Count -gt 0) {
+  Write-Host ""
+  Write-Host "[i] $($inventory.ThreatAnalysis.RecentModifications.Count) recent system file modifications (last 24h)" -ForegroundColor Cyan
+}
+
+# Baseline comparison summary
+if ($baselineComparison) {
+  Write-Host ""
+  Write-Host "========================================" -ForegroundColor Cyan
+  Write-Host "  BASELINE COMPARISON" -ForegroundColor Cyan
+  Write-Host "========================================" -ForegroundColor Cyan
+  Write-Host ""
+
+  if ($baselineComparison.TotalChanges -eq 0) {
+    Write-Host "[OK] No changes detected since baseline" -ForegroundColor Green
+  } else {
+    Write-Host "[!] CHANGES DETECTED: $($baselineComparison.TotalChanges) total changes since baseline" -ForegroundColor Yellow
+    Write-Host ""
+
+    if ($baselineComparison.Admins.Count -gt 0) {
+      Write-Host "  [!] Administrators Changed: $($baselineComparison.Admins.Count)" -ForegroundColor Red
+      if ($baselineComparison.Admins.Added.Count -gt 0) {
+        Write-Host "      Added: $($baselineComparison.Admins.Added -join ', ')" -ForegroundColor Red
+      }
+      if ($baselineComparison.Admins.Removed.Count -gt 0) {
+        Write-Host "      Removed: $($baselineComparison.Admins.Removed -join ', ')" -ForegroundColor Yellow
+      }
+    }
+
+    if ($baselineComparison.Processes.Count -gt 0) {
+      Write-Host "  [i] Processes Changed: $($baselineComparison.Processes.Count) (+$($baselineComparison.Processes.Added.Count) / -$($baselineComparison.Processes.Removed.Count))" -ForegroundColor Yellow
+      if ($baselineComparison.Processes.Added.Count -gt 0) {
+        $topItems = $baselineComparison.Processes.Added | Select-Object -First 5
+        foreach ($item in $topItems) { Write-Host "      + $item" -ForegroundColor Green }
+        if ($baselineComparison.Processes.Added.Count -gt 5) {
+          Write-Host "      ... and $($baselineComparison.Processes.Added.Count - 5) more" -ForegroundColor DarkGray
+        }
+      }
+      if ($baselineComparison.Processes.Removed.Count -gt 0) {
+        $topItems = $baselineComparison.Processes.Removed | Select-Object -First 3
+        foreach ($item in $topItems) { Write-Host "      - $item" -ForegroundColor Red }
+        if ($baselineComparison.Processes.Removed.Count -gt 3) {
+          Write-Host "      ... and $($baselineComparison.Processes.Removed.Count - 3) more" -ForegroundColor DarkGray
+        }
+      }
+      Write-Host "      See: $($baselineComparison.Processes.Csv)" -ForegroundColor Cyan
+    }
+
+    if ($baselineComparison.Services.Count -gt 0) {
+      Write-Host "  [i] Services Changed: $($baselineComparison.Services.Count) (+$($baselineComparison.Services.Added.Count) / -$($baselineComparison.Services.Removed.Count))" -ForegroundColor Yellow
+      if ($baselineComparison.Services.Added.Count -gt 0) {
+        $topItems = $baselineComparison.Services.Added | Select-Object -First 5
+        foreach ($item in $topItems) { Write-Host "      + $item" -ForegroundColor Green }
+        if ($baselineComparison.Services.Added.Count -gt 5) {
+          Write-Host "      ... and $($baselineComparison.Services.Added.Count - 5) more" -ForegroundColor DarkGray
+        }
+      }
+      if ($baselineComparison.Services.Removed.Count -gt 0) {
+        $topItems = $baselineComparison.Services.Removed | Select-Object -First 3
+        foreach ($item in $topItems) { Write-Host "      - $item" -ForegroundColor Red }
+        if ($baselineComparison.Services.Removed.Count -gt 3) {
+          Write-Host "      ... and $($baselineComparison.Services.Removed.Count - 3) more" -ForegroundColor DarkGray
+        }
+      }
+      Write-Host "      See: $($baselineComparison.Services.Csv)" -ForegroundColor Cyan
+    }
+
+    if ($baselineComparison.Tasks.Count -gt 0) {
+      Write-Host "  [i] Tasks Changed: $($baselineComparison.Tasks.Count) (+$($baselineComparison.Tasks.Added.Count) / -$($baselineComparison.Tasks.Removed.Count))" -ForegroundColor Yellow
+      if ($baselineComparison.Tasks.Added.Count -gt 0) {
+        $topItems = $baselineComparison.Tasks.Added | Select-Object -First 5
+        foreach ($item in $topItems) { Write-Host "      + $item" -ForegroundColor Green }
+        if ($baselineComparison.Tasks.Added.Count -gt 5) {
+          Write-Host "      ... and $($baselineComparison.Tasks.Added.Count - 5) more" -ForegroundColor DarkGray
+        }
+      }
+      if ($baselineComparison.Tasks.Removed.Count -gt 0) {
+        $topItems = $baselineComparison.Tasks.Removed | Select-Object -First 3
+        foreach ($item in $topItems) { Write-Host "      - $item" -ForegroundColor Red }
+        if ($baselineComparison.Tasks.Removed.Count -gt 3) {
+          Write-Host "      ... and $($baselineComparison.Tasks.Removed.Count - 3) more" -ForegroundColor DarkGray
+        }
+      }
+      Write-Host "      See: $($baselineComparison.Tasks.Csv)" -ForegroundColor Cyan
+    }
+
+    if ($baselineComparison.Users.Count -gt 0) {
+      Write-Host "  [i] Users Changed: $($baselineComparison.Users.Count) (+$($baselineComparison.Users.Added.Count) / -$($baselineComparison.Users.Removed.Count))" -ForegroundColor Yellow
+      if ($baselineComparison.Users.Added.Count -gt 0) {
+        foreach ($item in $baselineComparison.Users.Added) { Write-Host "      + $item" -ForegroundColor Green }
+      }
+      if ($baselineComparison.Users.Removed.Count -gt 0) {
+        foreach ($item in $baselineComparison.Users.Removed) { Write-Host "      - $item" -ForegroundColor Red }
+      }
+      Write-Host "      See: $($baselineComparison.Users.Csv)" -ForegroundColor Cyan
+    }
+
+    if ($baselineComparison.Autoruns.Count -gt 0) {
+      Write-Host "  [i] Autoruns Changed: $($baselineComparison.Autoruns.Count) (+$($baselineComparison.Autoruns.Added.Count) / -$($baselineComparison.Autoruns.Removed.Count))" -ForegroundColor Yellow
+      if ($baselineComparison.Autoruns.Added.Count -gt 0) {
+        $topItems = $baselineComparison.Autoruns.Added | Select-Object -First 5
+        foreach ($item in $topItems) { Write-Host "      + $item" -ForegroundColor Green }
+        if ($baselineComparison.Autoruns.Added.Count -gt 5) {
+          Write-Host "      ... and $($baselineComparison.Autoruns.Added.Count - 5) more" -ForegroundColor DarkGray
+        }
+      }
+      if ($baselineComparison.Autoruns.Removed.Count -gt 0) {
+        $topItems = $baselineComparison.Autoruns.Removed | Select-Object -First 3
+        foreach ($item in $topItems) { Write-Host "      - $item" -ForegroundColor Red }
+        if ($baselineComparison.Autoruns.Removed.Count -gt 3) {
+          Write-Host "      ... and $($baselineComparison.Autoruns.Removed.Count - 3) more" -ForegroundColor DarkGray
+        }
+      }
+      Write-Host "      See: $($baselineComparison.Autoruns.Csv)" -ForegroundColor Cyan
+    }
+
+    if ($baselineComparison.Shares.Count -gt 0) {
+      Write-Host "  [i] Shares Changed: $($baselineComparison.Shares.Count) (+$($baselineComparison.Shares.Added.Count) / -$($baselineComparison.Shares.Removed.Count))" -ForegroundColor Yellow
+      if ($baselineComparison.Shares.Added.Count -gt 0) {
+        foreach ($item in $baselineComparison.Shares.Added) { Write-Host "      + $item" -ForegroundColor Green }
+      }
+      if ($baselineComparison.Shares.Removed.Count -gt 0) {
+        foreach ($item in $baselineComparison.Shares.Removed) { Write-Host "      - $item" -ForegroundColor Red }
+      }
+      Write-Host "      See: $($baselineComparison.Shares.Csv)" -ForegroundColor Cyan
+    }
+
+    if ($baselineComparison.Software.Count -gt 0) {
+      Write-Host "  [i] Software Changed: $($baselineComparison.Software.Count) (+$($baselineComparison.Software.Added.Count) / -$($baselineComparison.Software.Removed.Count))" -ForegroundColor Cyan
+      if ($baselineComparison.Software.Added.Count -gt 0) {
+        $topItems = $baselineComparison.Software.Added | Select-Object -First 5
+        foreach ($item in $topItems) { Write-Host "      + $item" -ForegroundColor Green }
+        if ($baselineComparison.Software.Added.Count -gt 5) {
+          Write-Host "      ... and $($baselineComparison.Software.Added.Count - 5) more" -ForegroundColor DarkGray
+        }
+      }
+      if ($baselineComparison.Software.Removed.Count -gt 0) {
+        $topItems = $baselineComparison.Software.Removed | Select-Object -First 3
+        foreach ($item in $topItems) { Write-Host "      - $item" -ForegroundColor Red }
+        if ($baselineComparison.Software.Removed.Count -gt 3) {
+          Write-Host "      ... and $($baselineComparison.Software.Removed.Count - 3) more" -ForegroundColor DarkGray
+        }
+      }
+      Write-Host "      See: $($baselineComparison.Software.Csv)" -ForegroundColor Cyan
+    }
+  }
+}
+
+Write-Host ""
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Review the HTML report for detailed threat analysis:" -ForegroundColor White
+Write-Host "   $htmlPath" -ForegroundColor Cyan
 Write-Host ""

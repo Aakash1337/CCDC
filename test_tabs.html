@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset='UTF-8'>
+<title>Tab Test</title>
+<style>
+.tab-nav { background: white; border-bottom: 2px solid #667eea; }
+.tab-nav ul { list-style: none; margin: 0; padding: 0; display: flex; }
+.tab-nav button { background: none; border: none; padding: 15px 25px; font-size: 1em; cursor: pointer; }
+.tab-nav button.active { color: #667eea; border-bottom: 3px solid #667eea; }
+.tab-content { display: none; padding: 20px; }
+.tab-content.active { display: block; }
+</style>
+</head>
+<body>
+
+<nav class='tab-nav'><ul>
+<li><button onclick="switchTab('tab1', this)" class='active'>Tab 1</button></li>
+<li><button onclick="switchTab('tab2', this)">Tab 2</button></li>
+<li><button onclick="switchTab('tab3', this)">Tab 3</button></li>
+</ul></nav>
+
+<div id='tab1' class='tab-content active'>
+<h2>Tab 1 Content</h2>
+<p>This is tab 1</p>
+</div>
+
+<div id='tab2' class='tab-content'>
+<h2>Tab 2 Content</h2>
+<p>This is tab 2</p>
+</div>
+
+<div id='tab3' class='tab-content'>
+<h2>Tab 3 Content</h2>
+<p>This is tab 3</p>
+</div>
+
+<script>
+function switchTab(tabName, button) {
+  // Hide all tabs
+  var tabs = document.getElementsByClassName('tab-content');
+  for (var i = 0; i < tabs.length; i++) {
+    tabs[i].classList.remove('active');
+  }
+
+  // Deactivate all buttons
+  var buttons = document.querySelectorAll('.tab-nav button');
+  for (var j = 0; j < buttons.length; j++) {
+    buttons[j].classList.remove('active');
+  }
+
+  // Show selected tab
+  document.getElementById(tabName).classList.add('active');
+
+  // Activate clicked button
+  button.classList.add('active');
+}
+</script>
+
+</body>
+</html>
