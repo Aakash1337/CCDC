@@ -459,22 +459,28 @@ function Backup-Path {
   
   $item = Get-Item $SourcePath
   
+  # Build params for Test-ShouldBackupFile
+  $testParams = @{ File = $null }
+  if ($BaselineDate) { $testParams.BaselineDate = $BaselineDate }
+
   if ($item.PSIsContainer) {
     # Directory - process recursively
     $files = Get-ChildItem -Path $SourcePath -Recurse -File -ErrorAction SilentlyContinue
-    
+
     foreach ($file in $files) {
-      if (Test-ShouldBackupFile -File $file -BaselineDate $BaselineDate) {
+      $testParams.File = $file
+      if (Test-ShouldBackupFile @testParams) {
         $relativePath = $file.FullName.Substring($SourcePath.Length).TrimStart('\')
         $destPath = Join-Path $DestinationFolder (Split-Path -Leaf $SourcePath)
         $destPath = Join-Path $destPath $relativePath
-        
+
         $null = Copy-FileWithMetadata -SourcePath $file.FullName -DestinationPath $destPath
       }
     }
   } else {
     # Single file
-    if (Test-ShouldBackupFile -File $item -BaselineDate $BaselineDate) {
+    $testParams.File = $item
+    if (Test-ShouldBackupFile @testParams) {
       $destPath = Join-Path $DestinationFolder $item.Name
       $null = Copy-FileWithMetadata -SourcePath $item.FullName -DestinationPath $destPath
     }
@@ -781,7 +787,11 @@ try {
   # Backup each source path
   Write-Log "Processing $($SourcePaths.Count) source path(s)..."
   foreach ($sourcePath in $SourcePaths) {
-    Backup-Path -SourcePath $sourcePath -DestinationFolder $backupFolder -BaselineDate $baselineDate
+    if ($baselineDate) {
+      Backup-Path -SourcePath $sourcePath -DestinationFolder $backupFolder -BaselineDate $baselineDate
+    } else {
+      Backup-Path -SourcePath $sourcePath -DestinationFolder $backupFolder
+    }
   }
   
   # Compress if requested
