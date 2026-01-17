@@ -106,7 +106,10 @@ function Write-Log {
     [string]$Level = 'INFO'
   )
   $line = "[{0}] [{1}] {2}" -f (Get-Date -Format "s"), $Level, $Msg
-  $line | Tee-Object -FilePath $logFile -Append
+  # Write to console
+  Write-Host $line
+  # Append to log file without triggering ShouldProcess
+  [System.IO.File]::AppendAllText($logFile, "$line`r`n")
 }
 
 # --- Rollback Mode ---
@@ -182,7 +185,7 @@ if ($Rollback) {
 
   # Export rollback actions
   $rollbackCsv = Join-Path $OutDir "rollback_$ts.csv"
-  $rollbackActions | Export-Csv -NoTypeInformation -Path $rollbackCsv
+  $rollbackActions | Export-Csv -NoTypeInformation -Path $rollbackCsv -Confirm:$false
 
   Write-Log "=== ROLLBACK SUMMARY ==="
   Write-Log "Accounts restored: $restoredCount"
@@ -272,7 +275,7 @@ if (-not (Get-Command Get-LocalUser -ErrorAction SilentlyContinue)) {
 $usersBefore = Get-LocalUser | Select-Object `
   Name, Enabled, Description, LastLogon, PasswordRequired, PasswordExpires, SID, PrincipalSource
 
-$usersBefore | Export-Csv -NoTypeInformation -Path $beforeCsv
+$usersBefore | Export-Csv -NoTypeInformation -Path $beforeCsv -Confirm:$false
 Write-Log "Exported BEFORE inventory to: $beforeCsv"
 
 # --- Decide actions ---
@@ -337,14 +340,14 @@ foreach ($u in $usersBefore) {
   $actions.Add($action)
 }
 
-$actions | Export-Csv -NoTypeInformation -Path $actionsCsv
+$actions | Export-Csv -NoTypeInformation -Path $actionsCsv -Confirm:$false
 Write-Log "Exported actions to: $actionsCsv"
 
 # --- Export after state ---
 $usersAfter = Get-LocalUser | Select-Object `
   Name, Enabled, Description, LastLogon, PasswordRequired, PasswordExpires, SID, PrincipalSource
 
-$usersAfter | Export-Csv -NoTypeInformation -Path $afterCsv
+$usersAfter | Export-Csv -NoTypeInformation -Path $afterCsv -Confirm:$false
 Write-Log "Exported AFTER inventory to: $afterCsv"
 
 # --- Summary ---
