@@ -607,7 +607,7 @@ function Send-EmailNotification {
   
   try {
     $duration = [math]::Round(((Get-Date) - $script:StartTime).TotalMinutes, 2)
-    $status = if ($script:Stats.Errors -gt 0) { "⚠ COMPLETED WITH ERRORS" } else { "✓ SUCCESS" }
+    $status = if ($script:Stats.Errors -gt 0) { "[!] COMPLETED WITH ERRORS" } else { "[OK] SUCCESS" }
     
     $subject = if ($EmailSubject) { 
       $EmailSubject 
