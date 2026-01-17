@@ -10,6 +10,9 @@
     - Detailed logging
     - Exclusion patterns
     - Verification and integrity checks
+    - VSS (Volume Shadow Copy) support for locked files
+    - SHA256 file manifest for integrity verification
+    - Network retry logic with exponential backoff
 
 .PARAMETER SourcePaths
   Array of paths to backup (files or folders).
@@ -47,6 +50,15 @@
 .PARAMETER EmailSubject
   Custom email subject (default: auto-generated).
 
+.PARAMETER UseVSS
+  Use Volume Shadow Copy for backing up locked files (requires admin).
+
+.PARAMETER GenerateManifest
+  Generate SHA256 hash manifest for integrity verification.
+
+.PARAMETER NetworkRetries
+  Number of retries for network operations (default: 3).
+
 .EXAMPLE
   .\Backup-Files.ps1 -SourcePaths "C:\Users\John\Documents","C:\Projects" -DestinationRoot "D:\Backups"
 
@@ -56,9 +68,13 @@
 .EXAMPLE
   .\Backup-Files.ps1 -SourcePaths "C:\Data" -DestinationRoot "D:\Backups" -EmailReport -SmtpServer "smtp.gmail.com" -EmailFrom "backup@company.com" -EmailTo "admin@company.com"
 
+.EXAMPLE
+  .\Backup-Files.ps1 -SourcePaths "C:\Windows\System32\config" -DestinationRoot "D:\Backups" -UseVSS -GenerateManifest -Verify
+
 .NOTES
-  Version: 1.0
+  Version: 1.1
   Schedule with Task Scheduler for automatic backups.
+  VSS requires administrator privileges.
 #>
 
 [CmdletBinding()]
@@ -94,8 +110,15 @@ param(
   [switch]$UseSSL,
   
   [int]$SmtpPort = 587,
-  
-  [PSCredential]$SmtpCredential
+
+  [PSCredential]$SmtpCredential,
+
+  [switch]$UseVSS,
+
+  [switch]$GenerateManifest,
+
+  [ValidateRange(0,10)]
+  [int]$NetworkRetries = 3
 )
 
 Set-StrictMode -Version Latest
@@ -159,6 +182,183 @@ function Write-Log {
   
   if ($Level -eq "WARN") { $script:Stats.Warnings++ }
   if ($Level -eq "ERROR") { $script:Stats.Errors++ }
+}
+
+function Invoke-WithRetry {
+  param(
+    [Parameter(Mandatory)]
+    [scriptblock]$ScriptBlock,
+    [int]$MaxRetries = $NetworkRetries,
+    [string]$OperationName = "Operation"
+  )
+
+  $attempt = 0
+  $lastError = $null
+
+  while ($attempt -le $MaxRetries) {
+    try {
+      return & $ScriptBlock
+    } catch {
+      $lastError = $_
+      $attempt++
+
+      if ($attempt -le $MaxRetries) {
+        $waitSeconds = [math]::Pow(2, $attempt)
+        Write-Log "$OperationName failed (attempt $attempt/$MaxRetries), retrying in ${waitSeconds}s: $($_.Exception.Message)" -Level "WARN"
+        Start-Sleep -Seconds $waitSeconds
+      }
+    }
+  }
+
+  throw $lastError
+}
+
+function New-VSSSnapshot {
+  param([string]$DriveLetter)
+
+  if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Log "VSS requires administrator privileges - skipping shadow copy" -Level "WARN"
+    return $null
+  }
+
+  try {
+    Write-Log "Creating VSS snapshot for drive $DriveLetter..."
+
+    $shadowResult = (Get-WmiObject -List Win32_ShadowCopy).Create("${DriveLetter}\", "ClientAccessible")
+    if ($shadowResult.ReturnValue -ne 0) {
+      throw "VSS creation failed with code: $($shadowResult.ReturnValue)"
+    }
+
+    $shadowCopy = Get-WmiObject Win32_ShadowCopy | Where-Object { $_.ID -eq $shadowResult.ShadowID }
+    $shadowPath = $shadowCopy.DeviceObject + "\"
+
+    Write-Log "VSS snapshot created: $shadowPath" -Level "SUCCESS"
+
+    return [pscustomobject]@{
+      ShadowID = $shadowResult.ShadowID
+      ShadowPath = $shadowPath
+      DriveLetter = $DriveLetter
+    }
+  } catch {
+    Write-Log "Failed to create VSS snapshot: $_" -Level "WARN"
+    return $null
+  }
+}
+
+function Remove-VSSSnapshot {
+  param([pscustomobject]$Snapshot)
+
+  if (-not $Snapshot) { return }
+
+  try {
+    $shadowCopy = Get-WmiObject Win32_ShadowCopy | Where-Object { $_.ID -eq $Snapshot.ShadowID }
+    if ($shadowCopy) {
+      $shadowCopy.Delete()
+      Write-Log "VSS snapshot removed" -Level "SUCCESS"
+    }
+  } catch {
+    Write-Log "Failed to remove VSS snapshot: $_" -Level "WARN"
+  }
+}
+
+function Get-VSSPath {
+  param(
+    [string]$OriginalPath,
+    [hashtable]$VSSSnapshots
+  )
+
+  if (-not $VSSSnapshots -or $VSSSnapshots.Count -eq 0) {
+    return $OriginalPath
+  }
+
+  $driveLetter = Split-Path -Qualifier $OriginalPath
+  if ($VSSSnapshots.ContainsKey($driveLetter)) {
+    $snapshot = $VSSSnapshots[$driveLetter]
+    $relativePath = $OriginalPath.Substring($driveLetter.Length)
+    return $snapshot.ShadowPath + $relativePath.TrimStart('\')
+  }
+
+  return $OriginalPath
+}
+
+function New-FileManifest {
+  param(
+    [Parameter(Mandatory)]
+    [string]$BackupFolder,
+    [Parameter(Mandatory)]
+    [string]$ManifestPath
+  )
+
+  Write-Log "Generating file manifest with SHA256 hashes..."
+
+  try {
+    $manifest = @()
+    $files = Get-ChildItem -Path $BackupFolder -Recurse -File -ErrorAction SilentlyContinue
+
+    $fileCount = 0
+    foreach ($file in $files) {
+      $hash = (Get-FileHash -Path $file.FullName -Algorithm SHA256).Hash
+      $relativePath = $file.FullName.Substring($BackupFolder.Length).TrimStart('\')
+
+      $manifest += [pscustomobject]@{
+        Path = $relativePath
+        SHA256 = $hash
+        Size = $file.Length
+        Modified = $file.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
+      }
+      $fileCount++
+    }
+
+    $manifest | Export-Csv -Path $ManifestPath -NoTypeInformation -Encoding UTF8
+    Write-Log "Manifest generated: $fileCount files hashed" -Level "SUCCESS"
+
+    return $ManifestPath
+  } catch {
+    Write-Log "Failed to generate manifest: $_" -Level "ERROR"
+    return $null
+  }
+}
+
+function Test-ManifestIntegrity {
+  param(
+    [Parameter(Mandatory)]
+    [string]$BackupFolder,
+    [Parameter(Mandatory)]
+    [string]$ManifestPath
+  )
+
+  Write-Log "Verifying files against manifest..."
+
+  try {
+    $manifest = Import-Csv -Path $ManifestPath
+    $failures = 0
+
+    foreach ($entry in $manifest) {
+      $filePath = Join-Path $BackupFolder $entry.Path
+      if (-not (Test-Path $filePath)) {
+        Write-Log "Missing file: $($entry.Path)" -Level "ERROR"
+        $failures++
+        continue
+      }
+
+      $currentHash = (Get-FileHash -Path $filePath -Algorithm SHA256).Hash
+      if ($currentHash -ne $entry.SHA256) {
+        Write-Log "Hash mismatch: $($entry.Path)" -Level "ERROR"
+        $failures++
+      }
+    }
+
+    if ($failures -eq 0) {
+      Write-Log "Manifest verification passed: $($manifest.Count) files verified" -Level "SUCCESS"
+      return $true
+    } else {
+      Write-Log "Manifest verification failed: $failures file(s) with issues" -Level "ERROR"
+      return $false
+    }
+  } catch {
+    Write-Log "Manifest verification failed: $_" -Level "ERROR"
+    return $false
+  }
 }
 
 function Initialize-BackupEnvironment {
@@ -249,27 +449,42 @@ function Copy-FileWithMetadata {
     [Parameter(Mandatory)]
     [string]$DestinationPath
   )
-  
-  try {
+
+  # Check if destination is a network path (UNC or mapped drive pointing to network)
+  $isNetworkPath = $DestinationPath -match '^\\\\' -or
+    ((Split-Path -Qualifier $DestinationPath -ErrorAction SilentlyContinue) -and
+     (Get-WmiObject Win32_LogicalDisk -Filter "DeviceID='$(Split-Path -Qualifier $DestinationPath)'" -ErrorAction SilentlyContinue).DriveType -eq 4)
+
+  $copyOperation = {
     # Ensure destination directory exists
     $destDir = Split-Path -Parent $DestinationPath
     if (-not (Test-Path $destDir)) {
       New-Item -ItemType Directory -Path $destDir -Force | Out-Null
     }
-    
+
     # Copy file preserving timestamps
     Copy-Item -Path $SourcePath -Destination $DestinationPath -Force
-    
+
     # Preserve timestamps
     $sourceFile = Get-Item $SourcePath
     $destFile = Get-Item $DestinationPath
     $destFile.CreationTime = $sourceFile.CreationTime
     $destFile.LastWriteTime = $sourceFile.LastWriteTime
     $destFile.LastAccessTime = $sourceFile.LastAccessTime
-    
+
+    return $sourceFile.Length
+  }
+
+  try {
+    if ($isNetworkPath -and $NetworkRetries -gt 0) {
+      $fileSize = Invoke-WithRetry -ScriptBlock $copyOperation -OperationName "Copy $SourcePath"
+    } else {
+      $fileSize = & $copyOperation
+    }
+
     $script:Stats.FilesProcessed++
-    $script:Stats.BytesProcessed += $sourceFile.Length
-    
+    $script:Stats.BytesProcessed += $fileSize
+
     return $true
   } catch {
     Write-Log "Failed to copy file $SourcePath : $_" -Level "ERROR"
@@ -284,36 +499,40 @@ function Backup-Path {
     [string]$SourcePath,
     [Parameter(Mandatory)]
     [string]$DestinationFolder,
-    [datetime]$BaselineDate
+    [datetime]$BaselineDate,
+    [hashtable]$VSSSnapshots
   )
-  
+
   Write-Log "Processing: $SourcePath"
-  
+
   if (-not (Test-Path $SourcePath)) {
     Write-Log "Source path not found: $SourcePath" -Level "ERROR"
     return
   }
-  
+
   $item = Get-Item $SourcePath
-  
+
   if ($item.PSIsContainer) {
     # Directory - process recursively
     $files = Get-ChildItem -Path $SourcePath -Recurse -File -ErrorAction SilentlyContinue
-    
+
     foreach ($file in $files) {
       if (Test-ShouldBackupFile -File $file -BaselineDate $BaselineDate) {
         $relativePath = $file.FullName.Substring($SourcePath.Length).TrimStart('\')
         $destPath = Join-Path $DestinationFolder (Split-Path -Leaf $SourcePath)
         $destPath = Join-Path $destPath $relativePath
-        
-        $null = Copy-FileWithMetadata -SourcePath $file.FullName -DestinationPath $destPath
+
+        # Use VSS path if available for locked file access
+        $effectiveSource = Get-VSSPath -OriginalPath $file.FullName -VSSSnapshots $VSSSnapshots
+        $null = Copy-FileWithMetadata -SourcePath $effectiveSource -DestinationPath $destPath
       }
     }
   } else {
     # Single file
     if (Test-ShouldBackupFile -File $item -BaselineDate $BaselineDate) {
       $destPath = Join-Path $DestinationFolder $item.Name
-      $null = Copy-FileWithMetadata -SourcePath $item.FullName -DestinationPath $destPath
+      $effectiveSource = Get-VSSPath -OriginalPath $item.FullName -VSSSnapshots $VSSSnapshots
+      $null = Copy-FileWithMetadata -SourcePath $effectiveSource -DestinationPath $destPath
     }
   }
 }
@@ -357,6 +576,12 @@ function Compress-Backup {
       $newLogPath = "$zipPath.log"
       Copy-Item -Path $script:LogPath -Destination $newLogPath -Force
       $script:LogPath = $newLogPath
+    }
+
+    # Move manifest file outside backup folder before removing it
+    $manifestFile = Join-Path $BackupFolder "manifest.csv"
+    if (Test-Path $manifestFile) {
+      Copy-Item -Path $manifestFile -Destination "$zipPath.manifest.csv" -Force
     }
 
     # Remove uncompressed folder
@@ -502,7 +727,7 @@ $($SourcePaths | ForEach-Object { "<li>$_</li>" } | Out-String)
 </ul>
 
 <hr>
-<p style='font-size: 0.9em; color: #666;'>Generated by Backup-Files.ps1 v1.0</p>
+<p style='font-size: 0.9em; color: #666;'>Generated by Backup-Files.ps1 v1.1</p>
 </body>
 </html>
 "@
@@ -567,21 +792,37 @@ function Show-Summary {
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  File Backup Utility v1.0" -ForegroundColor Cyan
+Write-Host "  File Backup Utility v1.1" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
+
+$vssSnapshots = @{}
 
 try {
   # Initialize
   $backupFolder = Initialize-BackupEnvironment -Root $DestinationRoot
   Write-Log "Backup started: $BackupMode mode" -Level "SUCCESS"
   Write-Log "Destination: $backupFolder"
-  
+
+  # Create VSS snapshots if requested
+  if ($UseVSS) {
+    $drives = $SourcePaths | ForEach-Object {
+      Split-Path -Qualifier $_ -ErrorAction SilentlyContinue
+    } | Select-Object -Unique | Where-Object { $_ }
+
+    foreach ($drive in $drives) {
+      $snapshot = New-VSSSnapshot -DriveLetter $drive
+      if ($snapshot) {
+        $vssSnapshots[$drive] = $snapshot
+      }
+    }
+  }
+
   # Get baseline for incremental/differential
   $baselineDate = $null
   if ($BackupMode -ne "Full") {
     $lastBackup = Get-LastBackupInfo -Root $DestinationRoot
-    
+
     if ($BackupMode -eq "Incremental" -and $lastBackup.LastBackup) {
       $baselineDate = $lastBackup.LastBackup.CreationTime
       Write-Log "Incremental backup - baseline: $($lastBackup.LastBackup.Name)"
@@ -593,18 +834,29 @@ try {
       $BackupMode = "Full"
     }
   }
-  
+
   # Backup each source path
   Write-Log "Processing $($SourcePaths.Count) source path(s)..."
   foreach ($sourcePath in $SourcePaths) {
-    Backup-Path -SourcePath $sourcePath -DestinationFolder $backupFolder -BaselineDate $baselineDate
+    Backup-Path -SourcePath $sourcePath -DestinationFolder $backupFolder -BaselineDate $baselineDate -VSSSnapshots $vssSnapshots
   }
-  
+
+  # Generate manifest before compression
+  $manifestPath = $null
+  if ($GenerateManifest) {
+    $manifestPath = Join-Path $backupFolder "manifest.csv"
+    $null = New-FileManifest -BackupFolder $backupFolder -ManifestPath $manifestPath
+  }
+
   # Compress if requested
   if ($CompressionLevel -ne "NoCompression") {
     $backupFolder = Compress-Backup -BackupFolder $backupFolder
+    # Update manifest path after compression
+    if ($manifestPath) {
+      $manifestPath = "$backupFolder.manifest.csv"
+    }
   }
-  
+
   # Verify integrity
   if ($Verify) {
     $verified = Test-BackupIntegrity -BackupPath $backupFolder
@@ -612,27 +864,32 @@ try {
       Write-Log "Backup verification failed!" -Level "ERROR"
     }
   }
-  
+
   # Cleanup old backups
   Remove-OldBackups -Root $DestinationRoot -Days $RetentionDays
-  
+
   # Calculate duration
   $duration = ((Get-Date) - $script:StartTime).TotalMinutes
-  
+
   Write-Log "Backup completed successfully" -Level "SUCCESS"
-  
+
   # Send email notification
   if ($EmailReport) {
     Send-EmailNotification -BackupPath $backupFolder
   }
-  
+
   # Show summary
   Show-Summary -BackupPath $backupFolder -Duration $duration
-  
+
 } catch {
   Write-Log "Backup failed: $_" -Level "ERROR"
   Write-Host ""
   Write-Host "BACKUP FAILED" -ForegroundColor Red
   Write-Host $_.Exception.Message -ForegroundColor Red
   exit 1
+} finally {
+  # Cleanup VSS snapshots
+  foreach ($snapshot in $vssSnapshots.Values) {
+    Remove-VSSSnapshot -Snapshot $snapshot
+  }
 }
