@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
   Flexible file/folder backup script with compression, rotation, and scheduling support.
+  Includes CCDC-specific defaults for critical system files.
 
 .DESCRIPTION
   Creates compressed backups of specified paths with:
@@ -10,12 +11,20 @@
     - Detailed logging
     - Exclusion patterns
     - Verification and integrity checks
+    - CCDC defaults for critical Windows paths
 
 .PARAMETER SourcePaths
-  Array of paths to backup (files or folders).
+  Array of paths to backup (files or folders). Not required if -CCDCDefaults is used.
 
 .PARAMETER DestinationRoot
   Root directory where backups will be stored.
+
+.PARAMETER CCDCDefaults
+  Use predefined CCDC-critical paths (web servers, DNS, registry, configs, etc.).
+  Automatically detects which services are present on the system.
+
+.PARAMETER AdditionalPaths
+  Extra paths to include when using -CCDCDefaults.
 
 .PARAMETER BackupMode
   Type of backup: Full, Incremental, or Differential (default: Full).
@@ -48,53 +57,65 @@
   Custom email subject (default: auto-generated).
 
 .EXAMPLE
-  .\Backup-Files.ps1 -SourcePaths "C:\Users\John\Documents","C:\Projects" -DestinationRoot "D:\Backups"
+  .\Backups.ps1 -CCDCDefaults -DestinationRoot "D:\Backups"
+  Backs up all CCDC-critical paths that exist on the system.
 
 .EXAMPLE
-  .\Backup-Files.ps1 -SourcePaths "C:\Important" -DestinationRoot "\\NAS\Backups" -BackupMode Incremental -RetentionDays 90 -Verify
+  .\Backups.ps1 -CCDCDefaults -AdditionalPaths "C:\CustomApp\Config" -DestinationRoot "D:\Backups"
+  CCDC defaults plus custom application config.
 
 .EXAMPLE
-  .\Backup-Files.ps1 -SourcePaths "C:\Data" -DestinationRoot "D:\Backups" -EmailReport -SmtpServer "smtp.gmail.com" -EmailFrom "backup@company.com" -EmailTo "admin@company.com"
+  .\Backups.ps1 -SourcePaths "C:\Users\John\Documents","C:\Projects" -DestinationRoot "D:\Backups"
+  Manual path specification.
+
+.EXAMPLE
+  .\Backups.ps1 -CCDCDefaults -DestinationRoot "\\NAS\Backups" -BackupMode Incremental -Verify
+  Incremental CCDC backup with verification.
 
 .NOTES
-  Version: 1.0
+  Version: 2.0
   Schedule with Task Scheduler for automatic backups.
+  Run as Administrator for full access to system files.
 #>
 
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory)]
   [string[]]$SourcePaths,
-  
+
   [Parameter(Mandatory)]
   [string]$DestinationRoot,
-  
+
+  # CCDC-specific options
+  [switch]$CCDCDefaults,
+
+  [string[]]$AdditionalPaths,
+
   [ValidateSet("Full","Incremental","Differential")]
   [string]$BackupMode = "Full",
-  
+
   [int]$RetentionDays = 30,
-  
+
   [ValidateSet("Optimal","Fastest","NoCompression")]
   [string]$CompressionLevel = "Optimal",
-  
+
   [string[]]$ExcludePatterns = @("*.tmp","*.temp","~$*","Thumbs.db","desktop.ini"),
-  
+
   [switch]$Verify,
-  
+
   [switch]$EmailReport,
-  
+
   [string]$SmtpServer,
-  
+
   [string]$EmailFrom,
-  
+
   [string[]]$EmailTo,
-  
+
   [string]$EmailSubject,
-  
+
   [switch]$UseSSL,
-  
+
   [int]$SmtpPort = 587,
-  
+
   [PSCredential]$SmtpCredential
 )
 
@@ -113,6 +134,155 @@ $script:Stats = @{
   BytesSkipped = 0
   Warnings = 0
   Errors = 0
+}
+
+# ---------------------------- CCDC Critical Paths ----------------------------
+
+function Get-CCDCCriticalPaths {
+  <#
+  .SYNOPSIS
+    Returns array of CCDC-critical paths that exist on the system.
+  #>
+
+  $criticalPaths = @()
+
+  # ===== SYSTEM CONFIGURATION =====
+  # Hosts file - attackers love to redirect traffic
+  $hostsFile = "$env:SystemRoot\System32\drivers\etc\hosts"
+  if (Test-Path $hostsFile) { $criticalPaths += $hostsFile }
+
+  # Network config
+  $etcFolder = "$env:SystemRoot\System32\drivers\etc"
+  if (Test-Path $etcFolder) { $criticalPaths += $etcFolder }
+
+  # Registry hives (SAM, SECURITY, SYSTEM, SOFTWARE) - credentials & config
+  $regConfig = "$env:SystemRoot\System32\config"
+  if (Test-Path $regConfig) { $criticalPaths += $regConfig }
+
+  # Scheduled Tasks - persistence mechanism
+  $tasks = "$env:SystemRoot\System32\Tasks"
+  if (Test-Path $tasks) { $criticalPaths += $tasks }
+
+  # Windows Event Logs - forensics
+  $eventLogs = "$env:SystemRoot\System32\winevt\Logs"
+  if (Test-Path $eventLogs) { $criticalPaths += $eventLogs }
+
+  # ===== DNS SERVER =====
+  $dnsZones = "$env:SystemRoot\System32\dns"
+  if (Test-Path $dnsZones) { $criticalPaths += $dnsZones }
+
+  # ===== ACTIVE DIRECTORY (Domain Controllers) =====
+  # NTDS database
+  $ntds = "$env:SystemRoot\NTDS"
+  if (Test-Path $ntds) { $criticalPaths += $ntds }
+
+  # SYSVOL - Group Policy, logon scripts
+  $sysvol = "$env:SystemRoot\SYSVOL"
+  if (Test-Path $sysvol) { $criticalPaths += $sysvol }
+
+  # ===== WEB SERVERS =====
+  # IIS
+  $iisRoot = "C:\inetpub"
+  if (Test-Path $iisRoot) { $criticalPaths += $iisRoot }
+
+  $iisConfig = "$env:SystemRoot\System32\inetsrv\config"
+  if (Test-Path $iisConfig) { $criticalPaths += $iisConfig }
+
+  # Apache (common locations)
+  @(
+    "C:\Apache24",
+    "C:\Apache2",
+    "C:\Program Files\Apache Group\Apache2",
+    "C:\Program Files (x86)\Apache Group\Apache2",
+    "C:\xampp\apache",
+    "C:\wamp\bin\apache"
+  ) | ForEach-Object {
+    if (Test-Path $_) { $criticalPaths += $_ }
+  }
+
+  # Nginx (common locations)
+  @(
+    "C:\nginx",
+    "C:\Program Files\nginx"
+  ) | ForEach-Object {
+    if (Test-Path $_) { $criticalPaths += $_ }
+  }
+
+  # ===== DATABASES =====
+  # SQL Server (common data locations)
+  @(
+    "C:\Program Files\Microsoft SQL Server\MSSQL*\MSSQL\DATA",
+    "C:\Program Files\Microsoft SQL Server\MSSQL*\MSSQL\Backup"
+  ) | ForEach-Object {
+    Get-ChildItem -Path $_ -ErrorAction SilentlyContinue | ForEach-Object {
+      $criticalPaths += $_.FullName
+    }
+  }
+
+  # MySQL (common locations)
+  @(
+    "C:\ProgramData\MySQL",
+    "C:\Program Files\MySQL\MySQL Server*\data",
+    "C:\xampp\mysql\data",
+    "C:\wamp\bin\mysql\mysql*\data"
+  ) | ForEach-Object {
+    Get-ChildItem -Path $_ -ErrorAction SilentlyContinue | ForEach-Object {
+      $criticalPaths += $_.FullName
+    }
+  }
+
+  # PostgreSQL
+  @(
+    "C:\Program Files\PostgreSQL\*\data",
+    "C:\ProgramData\PostgreSQL"
+  ) | ForEach-Object {
+    Get-ChildItem -Path $_ -ErrorAction SilentlyContinue | ForEach-Object {
+      $criticalPaths += $_.FullName
+    }
+  }
+
+  # ===== MAIL SERVERS =====
+  # hMailServer
+  $hmail = "C:\Program Files (x86)\hMailServer"
+  if (Test-Path $hmail) { $criticalPaths += $hmail }
+
+  # ===== FTP SERVERS =====
+  # FileZilla Server
+  @(
+    "C:\Program Files\FileZilla Server",
+    "C:\Program Files (x86)\FileZilla Server"
+  ) | ForEach-Object {
+    if (Test-Path $_) { $criticalPaths += $_ }
+  }
+
+  # ===== CERTIFICATES =====
+  # Machine certificates store
+  $certStore = "C:\ProgramData\Microsoft\Crypto"
+  if (Test-Path $certStore) { $criticalPaths += $certStore }
+
+  # ===== POWERSHELL PROFILES (persistence) =====
+  @(
+    "$env:SystemRoot\System32\WindowsPowerShell\v1.0\profile.ps1",
+    "$env:SystemRoot\System32\WindowsPowerShell\v1.0\Microsoft.PowerShell_profile.ps1",
+    "$env:ProgramFiles\PowerShell\7\profile.ps1"
+  ) | ForEach-Object {
+    if (Test-Path $_) { $criticalPaths += $_ }
+  }
+
+  # ===== STARTUP FOLDERS (persistence) =====
+  $startupAll = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
+  if (Test-Path $startupAll) { $criticalPaths += $startupAll }
+
+  # ===== FIREWALL RULES =====
+  # Export via script at backup time - can't directly copy these
+  # We'll back up the SharedAccess folder which has firewall config
+  $fwConfig = "$env:SystemRoot\System32\LogFiles\Firewall"
+  if (Test-Path $fwConfig) { $criticalPaths += $fwConfig }
+
+  # ===== SERVICES CONFIG =====
+  # Windows services are in registry, already backed up via config folder
+
+  return $criticalPaths | Select-Object -Unique
 }
 
 # ---------------------------- Helper Functions ----------------------------
@@ -551,15 +721,45 @@ function Show-Summary {
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  File Backup Utility v1.0" -ForegroundColor Cyan
+Write-Host "  CCDC Backup Utility v2.0" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
+
+# Resolve source paths
+if ($CCDCDefaults) {
+  Write-Host "Using CCDC default paths..." -ForegroundColor Yellow
+  $ccdcPaths = Get-CCDCCriticalPaths
+
+  if ($ccdcPaths.Count -eq 0) {
+    Write-Host "WARNING: No CCDC-critical paths found on this system!" -ForegroundColor Red
+  } else {
+    Write-Host "Found $($ccdcPaths.Count) CCDC-critical paths:" -ForegroundColor Green
+    $ccdcPaths | ForEach-Object { Write-Host "  - $_" -ForegroundColor Gray }
+  }
+
+  # Combine CCDC paths with any additional paths
+  $SourcePaths = @($ccdcPaths)
+  if ($AdditionalPaths) {
+    $SourcePaths += $AdditionalPaths
+    Write-Host "Added $($AdditionalPaths.Count) additional path(s)" -ForegroundColor Yellow
+  }
+
+  Write-Host ""
+}
+
+# Validate we have paths to backup
+if (-not $SourcePaths -or $SourcePaths.Count -eq 0) {
+  Write-Host "ERROR: No source paths specified." -ForegroundColor Red
+  Write-Host "Use -SourcePaths to specify paths, or -CCDCDefaults for CCDC-critical paths." -ForegroundColor Yellow
+  exit 1
+}
 
 try {
   # Initialize
   $backupFolder = Initialize-BackupEnvironment -Root $DestinationRoot
   Write-Log "Backup started: $BackupMode mode" -Level "SUCCESS"
   Write-Log "Destination: $backupFolder"
+  if ($CCDCDefaults) { Write-Log "Using CCDC defaults" }
   
   # Get baseline for incremental/differential
   $baselineDate = $null
