@@ -7,6 +7,8 @@
   - Writes an actions log (what would change / what changed).
   - Safety: will NOT disable the currently logged-in account.
   - By default, also protects "Administrator" unless you explicitly override protections.
+  - Supports rollback mode to re-enable accounts disabled by a previous run.
+  - Uses reliable Windows identity detection for anti-lockout protection.
 
 .EXAMPLE
   # Audit only (default mode - no changes made)
@@ -28,19 +30,36 @@
   # Enforce and allow disabling protected accounts (DANGEROUS)
   .\Disable-NonAllowedLocalUsers.ps1 -AllowedUsers @("CCDCAdmin") -Enforce -OverrideProtections
 
+.EXAMPLE
+  # Rollback: re-enable accounts disabled by a previous run
+  .\Disable-NonAllowedLocalUsers.ps1 -Rollback "C:\ProgramData\CCDC\UserControl\actions_20250115_143022.csv"
+
+.EXAMPLE
+  # Preview what -WhatIf would do (built-in PowerShell support)
+  .\Disable-NonAllowedLocalUsers.ps1 -AllowedUsers @("CCDCAdmin") -Enforce -WhatIf
+
 .OUTPUTS
-  Returns a PSCustomObject with:
+  Returns a PSCustomObject with (normal mode):
     - Success: Boolean indicating overall success
     - DisabledCount: Number of accounts disabled
     - FailedCount: Number of accounts that failed to disable
     - AuditedCount: Total accounts processed
     - LogFile: Path to the log file
     - ActionsCsv: Path to the actions CSV
+
+  Returns a PSCustomObject with (rollback mode):
+    - Success: Boolean indicating overall success
+    - RestoredCount: Number of accounts re-enabled
+    - FailedCount: Number of accounts that failed to restore
+    - LogFile: Path to the log file
+    - RollbackCsv: Path to the rollback actions CSV
 #>
 
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
-  [Parameter(Mandatory = $true)]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Enforce')]
+  [Parameter(Mandatory = $true, ParameterSetName = 'DryRun')]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Audit')]
   [string[]] $AllowedUsers,
 
   [Parameter(ParameterSetName = 'Enforce')]
@@ -48,6 +67,11 @@ param(
 
   [Parameter(ParameterSetName = 'DryRun')]
   [switch] $DryRun,
+
+  # Rollback mode: provide path to a previous actions CSV to re-enable disabled accounts
+  [Parameter(Mandatory = $true, ParameterSetName = 'Rollback')]
+  [ValidateScript({ Test-Path $_ -PathType Leaf })]
+  [string] $Rollback,
 
   # If set, you may disable even protected accounts (NOT recommended).
   [switch] $OverrideProtections,
@@ -85,13 +109,137 @@ function Write-Log {
   $line | Tee-Object -FilePath $logFile -Append
 }
 
+# --- Rollback Mode ---
+if ($Rollback) {
+  Write-Log "=== ROLLBACK MODE ==="
+  Write-Log "Reading actions from: $Rollback"
+
+  if (-not (Test-Path $Rollback)) {
+    Write-Log "ERROR: Rollback file not found: $Rollback" -Level ERROR
+    throw "Rollback file not found: $Rollback"
+  }
+
+  $previousActions = Import-Csv -Path $Rollback
+  $disabledActions = $previousActions | Where-Object { $_.ActionTaken -eq 'DISABLED' }
+
+  if ($disabledActions.Count -eq 0) {
+    Write-Log "No DISABLED accounts found in the rollback file. Nothing to restore."
+    Write-Output "No accounts to restore."
+    return [pscustomobject]@{
+      Success       = $true
+      RestoredCount = 0
+      FailedCount   = 0
+      LogFile       = $logFile
+    }
+  }
+
+  Write-Log "Found $($disabledActions.Count) account(s) to restore"
+
+  $restoredCount = 0
+  $rollbackFailedCount = 0
+  $rollbackActions = [System.Collections.Generic.List[pscustomobject]]::new()
+
+  foreach ($action in $disabledActions) {
+    $userName = $action.User
+    $rollbackResult = "NO_CHANGE"
+
+    # Verify the account still exists
+    $localUser = Get-LocalUser -Name $userName -ErrorAction SilentlyContinue
+    if (-not $localUser) {
+      Write-Log "SKIPPED: Account '$userName' no longer exists" -Level WARN
+      $rollbackResult = "ACCOUNT_NOT_FOUND"
+    } elseif ($localUser.Enabled) {
+      Write-Log "SKIPPED: Account '$userName' is already enabled"
+      $rollbackResult = "ALREADY_ENABLED"
+    } else {
+      if ($PSCmdlet.ShouldProcess($userName, "Enable local user account (rollback)")) {
+        try {
+          Write-Log "ENABLING: $userName"
+          Enable-LocalUser -Name $userName -ErrorAction Stop
+          Write-Log "ENABLED: $userName"
+          $rollbackResult = "RESTORED"
+          $restoredCount++
+        } catch {
+          $errorMsg = if ($_.Exception.Message) { $_.Exception.Message } else { $_.ToString() }
+          Write-Log "FAILED to enable ${userName}: $errorMsg" -Level ERROR
+          $rollbackResult = "FAILED"
+          $rollbackFailedCount++
+        }
+      } else {
+        Write-Log "SKIPPED (user declined): $userName"
+        $rollbackResult = "SKIPPED_BY_USER"
+      }
+    }
+
+    $rollbackActions.Add([pscustomobject]@{
+      User              = $userName
+      OriginalAction    = $action.ActionTaken
+      OriginalTimestamp = $action.Timestamp
+      RollbackResult    = $rollbackResult
+      Timestamp         = (Get-Date).ToString("s")
+    })
+  }
+
+  # Export rollback actions
+  $rollbackCsv = Join-Path $OutDir "rollback_$ts.csv"
+  $rollbackActions | Export-Csv -NoTypeInformation -Path $rollbackCsv
+
+  Write-Log "=== ROLLBACK SUMMARY ==="
+  Write-Log "Accounts restored: $restoredCount"
+  Write-Log "Accounts failed: $rollbackFailedCount"
+  Write-Log "Rollback actions exported to: $rollbackCsv"
+
+  Write-Output ""
+  Write-Output "Rollback complete:"
+  Write-Output "  Restored: $restoredCount"
+  Write-Output "  Failed:   $rollbackFailedCount"
+  Write-Output "  Log:      $logFile"
+  Write-Output "  Actions:  $rollbackCsv"
+
+  $rollbackResult = [pscustomobject]@{
+    Success       = ($rollbackFailedCount -eq 0)
+    RestoredCount = $restoredCount
+    FailedCount   = $rollbackFailedCount
+    LogFile       = $logFile
+    RollbackCsv   = $rollbackCsv
+  }
+
+  if ($rollbackFailedCount -gt 0) {
+    $host.SetShouldExit(1)
+  }
+
+  return $rollbackResult
+}
+
 # --- Determine current interactive username (anti-lockout) ---
-$currentUser = $env:USERNAME
+# Use WindowsIdentity for more reliable detection across different execution contexts
+try {
+  $windowsIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+  $currentUser = $windowsIdentity.Name.Split('\')[-1]
+} catch {
+  # Fallback to environment variable
+  $currentUser = $env:USERNAME
+}
 
 # Check if running as SYSTEM or another service account
-$isServiceAccount = $currentUser -match '\$$' -or $currentUser -eq 'SYSTEM'
+$isServiceAccount = $currentUser -match '\$$' -or
+                    $currentUser -eq 'SYSTEM' -or
+                    $currentUser -like '*$' -or
+                    $windowsIdentity.IsSystem
+
 if ($isServiceAccount) {
   Write-Log "WARNING: Running as service account '$currentUser'. Anti-lockout protection based on current user may not apply to interactive accounts." -Level WARN
+  # Try to get the logged-in console user as additional protection
+  try {
+    $consoleUser = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
+    if ($consoleUser) {
+      $consoleUserName = $consoleUser.Split('\')[-1]
+      Write-Log "Detected console user: $consoleUserName - adding to protected list" -Level INFO
+      $currentUser = $consoleUserName
+    }
+  } catch {
+    Write-Log "Could not detect console user: $($_.Exception.Message)" -Level WARN
+  }
 }
 
 # Normalize comparisons (case-insensitive)
@@ -128,7 +276,7 @@ $usersBefore | Export-Csv -NoTypeInformation -Path $beforeCsv
 Write-Log "Exported BEFORE inventory to: $beforeCsv"
 
 # --- Decide actions ---
-$actions = @()
+$actions = [System.Collections.Generic.List[pscustomobject]]::new()
 
 foreach ($u in $usersBefore) {
   $script:auditedCount++
@@ -161,7 +309,8 @@ foreach ($u in $usersBefore) {
           $actionResult = "DISABLED"
           $script:disabledCount++
         } catch {
-          Write-Log "FAILED to disable ${name}: $_" -Level ERROR
+          $errorMsg = if ($_.Exception.Message) { $_.Exception.Message } else { $_.ToString() }
+          Write-Log "FAILED to disable ${name}: $errorMsg" -Level ERROR
           $actionResult = "FAILED"
           $script:failedCount++
         }
@@ -185,7 +334,7 @@ foreach ($u in $usersBefore) {
     Mode            = $modeDescription
     Timestamp       = (Get-Date).ToString("s")
   }
-  $actions += $action
+  $actions.Add($action)
 }
 
 $actions | Export-Csv -NoTypeInformation -Path $actionsCsv
