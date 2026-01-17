@@ -380,7 +380,7 @@ function Test-ShouldBackupFile {
   param(
     [Parameter(Mandatory)]
     [System.IO.FileInfo]$File,
-    [datetime]$BaselineDate
+    [Nullable[datetime]]$BaselineDate
   )
   
   # Check exclusion patterns
@@ -447,7 +447,7 @@ function Backup-Path {
     [string]$SourcePath,
     [Parameter(Mandatory)]
     [string]$DestinationFolder,
-    [datetime]$BaselineDate
+    [Nullable[datetime]]$BaselineDate
   )
   
   Write-Log "Processing: $SourcePath"
