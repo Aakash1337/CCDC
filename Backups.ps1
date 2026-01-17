@@ -101,6 +101,13 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Validate email parameters if EmailReport is requested
+if ($EmailReport) {
+  if (-not $SmtpServer) { throw "EmailReport requires -SmtpServer parameter" }
+  if (-not $EmailFrom) { throw "EmailReport requires -EmailFrom parameter" }
+  if (-not $EmailTo) { throw "EmailReport requires -EmailTo parameter" }
+}
+
 # Script-level variables
 $script:StartTime = Get-Date
 $script:LogPath = $null
@@ -338,14 +345,23 @@ function Compress-Backup {
     
     $zipSize = (Get-Item $zipPath).Length
     $originalSize = (Get-ChildItem $BackupFolder -Recurse -File | Measure-Object -Property Length -Sum).Sum
-    $ratio = [math]::Round((1 - ($zipSize / $originalSize)) * 100, 2)
+    $ratio = if ($originalSize -gt 0) {
+      [math]::Round((1 - ($zipSize / $originalSize)) * 100, 2)
+    } else { 0 }
     
     Write-Log "Compressed backup created: $zipPath" -Level "SUCCESS"
     Write-Log "Compression ratio: $ratio% (Original: $([math]::Round($originalSize/1MB,2))MB → Compressed: $([math]::Round($zipSize/1MB,2))MB)"
-    
+
+    # Move log file outside backup folder before removing it
+    if ($script:LogPath -and (Test-Path $script:LogPath)) {
+      $newLogPath = "$zipPath.log"
+      Copy-Item -Path $script:LogPath -Destination $newLogPath -Force
+      $script:LogPath = $newLogPath
+    }
+
     # Remove uncompressed folder
     Remove-Item -Path $BackupFolder -Recurse -Force
-    
+
     return $zipPath
   } catch {
     Write-Log "Compression failed: $_" -Level "ERROR"
@@ -482,7 +498,7 @@ function Send-EmailNotification {
 
 <h3>Source Paths</h3>
 <ul>
-$(foreach($path in $SourcePaths){"<li>$path</li>"})
+$($SourcePaths | ForEach-Object { "<li>$_</li>" } | Out-String)
 </ul>
 
 <hr>
