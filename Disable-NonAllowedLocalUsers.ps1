@@ -55,17 +55,17 @@
     - RollbackCsv: Path to the rollback actions CSV
 #>
 
-[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High', DefaultParameterSetName = 'Audit')]
 param(
-  [Parameter(Mandatory = $true, ParameterSetName = 'Enforce')]
-  [Parameter(Mandatory = $true, ParameterSetName = 'DryRun')]
-  [Parameter(Mandatory = $true, ParameterSetName = 'Audit')]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Audit', Position = 0)]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Enforce', Position = 0)]
+  [Parameter(Mandatory = $true, ParameterSetName = 'DryRun', Position = 0)]
   [string[]] $AllowedUsers,
 
-  [Parameter(ParameterSetName = 'Enforce')]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Enforce')]
   [switch] $Enforce,
 
-  [Parameter(ParameterSetName = 'DryRun')]
+  [Parameter(Mandatory = $true, ParameterSetName = 'DryRun')]
   [switch] $DryRun,
 
   # Rollback mode: provide path to a previous actions CSV to re-enable disabled accounts
