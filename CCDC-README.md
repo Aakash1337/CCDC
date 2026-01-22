@@ -1,8 +1,14 @@
-# Get-WindowsInventory.ps1 - CCDC Enhanced Edition v2.2
+# CCDC Windows Security Toolkit v3.0
 
 ## 🎯 Overview
 
-This is a **CCDC-ready** Windows system inventory and threat detection script designed specifically for Collegiate Cyber Defense Competition teams. It provides comprehensive system baselining, automated threat detection, integrated baseline comparison, and actionable security recommendations.
+This is a **CCDC-ready** Windows security toolkit designed specifically for Collegiate Cyber Defense Competition teams. It includes:
+
+- **Get-WindowsInventory.ps1**: Comprehensive system inventory, threat detection, and baseline comparison
+- **Disable-NonAllowedLocalUsers.ps1**: Automated user account lockdown and hardening
+- **Compare-WindowsInventory.ps1**: Legacy standalone comparison tool (now integrated into main script)
+
+The toolkit provides comprehensive system baselining, automated threat detection, integrated baseline comparison, system hardening automation, and actionable security recommendations.
 
 ## 🆕 CCDC Enhancements (v2.2)
 
@@ -132,6 +138,129 @@ The diff tool will:
 - **Patches**: New/removed hotfixes
 - **Network Shares**: New/removed shares
 
+## 🛡️ System Hardening Tools
+
+### Disable-NonAllowedLocalUsers.ps1
+
+**Purpose**: Automatically disable all local user accounts except those on an approved whitelist. Essential for CCDC system lockdown!
+
+**Key Features:**
+- ✅ Whitelist-based: Only keeps specified accounts enabled
+- ✅ **Baseline Integration**: Can use Get-WindowsInventory.ps1 baseline as whitelist
+- ✅ Safety First: `-WhatIf` mode for dry-run testing
+- ✅ Auto-Protects: Skips currently logged-in user to prevent lockout
+- ✅ Built-in Exclusions: Optionally preserve system accounts (Administrator, Guest)
+- ✅ Comprehensive Logging: All actions logged to file
+- ✅ Confirmation Prompts: Requires 'YES' confirmation unless `-Force` used
+
+#### Quick Start
+
+```powershell
+# Method 1: Use baseline from Get-WindowsInventory.ps1 (RECOMMENDED)
+.\Disable-NonAllowedLocalUsers.ps1 -UseBaseline -WhatIf
+
+# Method 2: Provide allowed users manually
+.\Disable-NonAllowedLocalUsers.ps1 -AllowedUsers @("ccdc_admin","blue_team") -WhatIf
+
+# Method 3: Use whitelist file
+.\Disable-NonAllowedLocalUsers.ps1 -AllowedUsersFile ".\allowed_users.txt" -WhatIf
+```
+
+#### CCDC Workflow Integration
+
+**Step 1**: Create baseline with current enabled users:
+```powershell
+# Run inventory to snapshot current users
+.\Get-WindowsInventory.ps1 -Quick
+```
+
+**Step 2**: Review and clean unauthorized accounts manually, then update baseline:
+```powershell
+# Remove unauthorized users first
+net user hackerman /delete
+
+# Update baseline to reflect clean state
+.\Get-WindowsInventory.ps1 -UpdateBaseline
+```
+
+**Step 3**: Use baseline to disable any future unauthorized accounts:
+```powershell
+# Test what would be disabled (DRY-RUN)
+.\Disable-NonAllowedLocalUsers.ps1 -UseBaseline -WhatIf
+
+# Actually disable them
+.\Disable-NonAllowedLocalUsers.ps1 -UseBaseline -Force
+```
+
+#### Whitelist File Format
+
+Edit `allowed_users.txt`:
+```
+# One username per line
+# Lines starting with # are comments
+ccdc_admin
+blue_team_user
+system_admin
+```
+
+Then use it:
+```powershell
+.\Disable-NonAllowedLocalUsers.ps1 -AllowedUsersFile ".\allowed_users.txt"
+```
+
+#### Safety Features
+
+**WhatIf Mode** (Always test first!):
+```powershell
+# See what WOULD be disabled without actually doing it
+.\Disable-NonAllowedLocalUsers.ps1 -AllowedUsers @("admin") -WhatIf
+```
+
+**Output Example**:
+```
+[2026-01-22 10:30:15] [WARNING] The following accounts will be DISABLED:
+  - hackerman (Last logon: 2026-01-22 08:15)
+  - backdoor_user (Last logon: Never)
+[WHATIF MODE] No accounts will actually be disabled
+```
+
+**Current User Protection**:
+The script automatically skips the currently logged-in user even if they're not in the whitelist, preventing accidental lockout.
+
+**Built-in Account Handling**:
+```powershell
+# Keep system accounts (Administrator, Guest, DefaultAccount) enabled
+.\Disable-NonAllowedLocalUsers.ps1 -AllowedUsers @("ccdc_admin") -ExcludeBuiltIn
+
+# Disable everything except whitelist (including built-ins)
+.\Disable-NonAllowedLocalUsers.ps1 -AllowedUsers @("ccdc_admin") -ExcludeBuiltIn:$false
+```
+
+#### Advanced Usage
+
+**Custom Baseline Location**:
+```powershell
+.\Disable-NonAllowedLocalUsers.ps1 -UseBaseline -BaselinePath "C:\CCDC\baseline"
+```
+
+**Force Mode** (skip confirmation):
+```powershell
+# For automated scripts - disables without prompting
+.\Disable-NonAllowedLocalUsers.ps1 -AllowedUsers @("admin") -Force
+```
+
+**Custom Log Path**:
+```powershell
+.\Disable-NonAllowedLocalUsers.ps1 -AllowedUsers @("admin") -LogPath "C:\CCDC\logs\disable_users.log"
+```
+
+#### IMPORTANT WARNINGS
+
+⚠️ **Always run with `-WhatIf` first!**
+⚠️ **Make sure YOUR account is in the allowed list!**
+⚠️ **Test the whitelist before running with `-Force`**
+⚠️ **Keep backup admin access available**
+
 ## 📋 CCDC Workflow
 
 ### 1. Initial System Baseline (First 15 minutes)
@@ -155,11 +284,24 @@ Review these files in order of priority:
 
 1. **`security_weaknesses.csv`**: Fix critical issues first (disabled Defender, disabled Firewall)
 2. **`threat_unauthorized_admins.csv`**: Remove unauthorized administrator accounts
-3. **`threat_suspicious_processes.csv`**: Kill malicious processes
-4. **`threat_suspicious_services.csv`**: Stop and disable malicious services
-5. **`threat_suspicious_connections.csv`**: Identify C2 connections and block them
-6. **`threat_suspicious_tasks.csv`**: Disable or remove malicious scheduled tasks
-7. **`recent_system_modifications_24h.csv`**: Check for backdoored system files
+3. **`csv/users.csv`**: Review all local accounts, identify unauthorized users
+4. **`threat_suspicious_processes.csv`**: Kill malicious processes
+5. **`threat_suspicious_services.csv`**: Stop and disable malicious services
+6. **`threat_suspicious_connections.csv`**: Identify C2 connections and block them
+7. **`threat_suspicious_tasks.csv`**: Disable or remove malicious scheduled tasks
+8. **`recent_system_modifications_24h.csv`**: Check for backdoored system files
+
+**Quick Actions:**
+```powershell
+# Remove unauthorized admin
+net localgroup Administrators hackerman /delete
+
+# Delete unauthorized user account
+net user backdoor_user /delete
+
+# Or disable unauthorized user (safer - can investigate later)
+Disable-LocalUser -Name "suspicious_user"
+```
 
 ### 3. System Hardening & Baseline Update
 
@@ -167,9 +309,26 @@ After cleaning up threats and hardening:
 ```powershell
 # Update baseline to reflect clean, hardened state
 .\Get-WindowsInventory.ps1 -UpdateBaseline
+
+# Lock down user accounts using the clean baseline
+.\Disable-NonAllowedLocalUsers.ps1 -UseBaseline -WhatIf  # Test first!
+.\Disable-NonAllowedLocalUsers.ps1 -UseBaseline -Force    # Actually disable
 ```
 
 This refreshes your baseline so future scans compare against the **hardened** system!
+
+**Hardening Checklist:**
+- [ ] Remove unauthorized administrator accounts
+- [ ] Disable or delete unauthorized user accounts
+- [ ] Run `Disable-NonAllowedLocalUsers.ps1 -UseBaseline` to lock down users
+- [ ] Stop and disable suspicious services
+- [ ] Disable suspicious scheduled tasks
+- [ ] Enable UAC (if disabled)
+- [ ] Enable Windows Firewall (all profiles)
+- [ ] Enable Windows Defender Real-time Protection
+- [ ] Disable Guest account
+- [ ] Disable RDP (if not needed)
+- [ ] Update baseline: `.\Get-WindowsInventory.ps1 -UpdateBaseline`
 
 ### 4. Periodic Monitoring (Every 30-60 minutes)
 
@@ -448,21 +607,35 @@ New-NetFirewallRule -DisplayName "Block-C2" -Direction Outbound -RemoteAddress 1
 
 Use these tools as part of your defense strategy:
 
+**Initial Assessment (First 15 min):**
 - [ ] Run inventory on all systems within first 15 minutes (creates baseline automatically!)
 - [ ] Review threat analysis section immediately
 - [ ] Fix all CRITICAL security weaknesses
 - [ ] Remove unauthorized administrator accounts
+- [ ] Identify all unauthorized user accounts
+
+**Active Threat Removal (Next 30 min):**
 - [ ] Kill suspicious processes
 - [ ] Stop suspicious services
 - [ ] Block suspicious network connections
 - [ ] Disable suspicious scheduled tasks
 - [ ] Review recent file modifications
+- [ ] Delete or disable unauthorized user accounts
+
+**System Hardening (After cleanup):**
+- [ ] Run `.\Disable-NonAllowedLocalUsers.ps1 -UseBaseline -WhatIf` to test
+- [ ] Run `.\Disable-NonAllowedLocalUsers.ps1 -UseBaseline -Force` to lock down users
 - [ ] After threat cleanup, run with `-UpdateBaseline` to reset baseline
+- [ ] Enable UAC, Firewall, Windows Defender
+- [ ] Disable unnecessary services (RDP, Guest account)
+
+**Continuous Monitoring:**
 - [ ] Re-run periodically to detect changes (compares automatically!)
 - [ ] Review BASELINE COMPARISON section in HTML report
 - [ ] Check expandable tables for added/removed items
 - [ ] Review comparison CSV files for details
 - [ ] Investigate administrator changes (highest priority!)
+- [ ] Re-run `Disable-NonAllowedLocalUsers.ps1` if new users detected
 - [ ] Document all findings in incident log
 
 ## ⚡ Performance Tips
@@ -546,6 +719,22 @@ Import-Csv .\csv\security_weaknesses.csv | Where-Object Risk -eq 'Critical'
 5. **Red Team Analysis**: Identify what red team may have already done
 
 ## 📝 Version History
+
+### v3.0 (CCDC Hardening Suite) - 2026-01-22
+**New Tools:**
+- ⭐ **NEW**: `Disable-NonAllowedLocalUsers.ps1` - Automated user account lockdown
+  - Whitelist-based user account disabling
+  - Baseline integration with Get-WindowsInventory.ps1
+  - Safety features: `-WhatIf` mode, current user protection, confirmation prompts
+  - Support for file-based whitelists and manual arrays
+  - Comprehensive logging and status reporting
+  - Built-in account exclusion options
+
+**Documentation:**
+- Created `allowed_users.txt` template for whitelist management
+- Updated CCDC workflow to include user account hardening
+- Enhanced defense checklist with hardening steps
+- Added system hardening tools section to README
 
 ### v2.2 (CCDC Enhanced Edition with Integrated Baseline) - 2026-01-16
 **Get-WindowsInventory.ps1:**

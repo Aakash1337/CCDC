@@ -1,0 +1,11 @@
+# Allowed Local Users Whitelist
+# One username per line
+# Lines starting with # are comments and will be ignored
+# This file is used by Disable-NonAllowedLocalUsers.ps1
+
+# Example CCDC admin accounts:
+ccdc_admin
+blue_team_user
+system_admin
+
+# Add your legitimate user accounts below:
